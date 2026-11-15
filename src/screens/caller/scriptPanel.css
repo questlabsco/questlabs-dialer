@@ -1,0 +1,116 @@
+/* ScriptPanel. Neutral on purpose: the app's designer tunes the look. Theme variables only. */
+.sp {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  min-width: 0;
+}
+.sp-compact {
+  padding: var(--space-2) var(--space-3);
+  gap: var(--space-1);
+}
+.sp-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--control-height-sm);
+}
+.sp-title {
+  margin: 0;
+  font-size: var(--font-md);
+  font-weight: 600;
+  color: var(--text);
+}
+.sp-marker {
+  font-size: var(--font-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.sp-marker-mine {
+  color: var(--accent-text);
+}
+.sp-edit {
+  margin-left: auto;
+}
+.sp-body {
+  min-width: 0;
+}
+.sp-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--font-base);
+  line-height: 1.55;
+  color: var(--text);
+  max-height: 420px;
+  overflow-y: auto;
+}
+.sp-compact .sp-text {
+  font-size: var(--font-sm);
+  max-height: 220px;
+}
+.sp-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-sm);
+}
+.sp-empty {
+  margin: 0;
+  font-size: var(--font-sm);
+}
+.sp-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.sp-textarea {
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+  font-family: var(--font-sans);
+  font-size: var(--font-sm);
+  line-height: 1.5;
+}
+.sp-compact .sp-textarea {
+  min-height: 150px;
+}
+.sp-placeholders {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--font-xs);
+}
+.sp-token {
+  font-family: var(--font-mono);
+  font-size: var(--font-xs);
+  padding: 1px var(--space-1);
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.sp-token:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+.sp-token:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.sp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.sp-reset {
+  margin-left: auto;
+}
+.sp-error {
+  font-size: var(--font-sm);
+  color: var(--critical);
+}

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="84 88 532 468" width="532" height="468">
+  <defs>
+    <linearGradient id="ql-grad" gradientUnits="userSpaceOnUse" x1="410" y1="396" x2="606" y2="528">
+      <stop offset="0" stop-color="#2D3BFF"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <mask id="ql-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="712" height="622">
+      <rect x="0" y="0" width="712" height="622" fill="#fff"/>
+      <polygon points="162,300 410,300 701,600 453,600" fill="#000"/>
+    </mask>
+  </defs>
+  <circle cx="318" cy="322" r="197" fill="none" stroke="#141821" stroke-width="56" mask="url(#ql-cut)"/>
+  <polygon points="250,365 321,365 479,528 408,528" fill="#141821"/>
+  <polygon points="410,396 478,396 606,528 538,528" fill="url(#ql-grad)"/>
+</svg>

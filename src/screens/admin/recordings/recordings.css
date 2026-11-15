@@ -1,0 +1,76 @@
+.recordings-screen {
+  min-width: 0;
+  gap: var(--space-3);
+}
+
+.rec-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.rec-filters {
+  flex: none;
+}
+
+.rec-filter {
+  flex: 0 1 160px;
+  min-width: 130px;
+}
+
+.rec-date {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-xs);
+  color: var(--text-muted);
+}
+
+.rec-date-field {
+  width: 134px;
+}
+
+.rec-table-wrap {
+  flex: 1 1 auto;
+  min-height: 160px;
+}
+
+.rec-table-wrap.is-loading tbody {
+  opacity: 0.6;
+}
+
+.rec-error {
+  margin: var(--space-3) 0;
+}
+
+.rec-biz {
+  display: inline-block;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
+.rec-table tbody tr.rec-player-row td {
+  background: var(--surface-2);
+  white-space: normal;
+  height: auto;
+}
+
+.rec-player {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) 0;
+}
+
+.rec-player audio {
+  width: 100%;
+  max-width: 560px;
+  height: 32px;
+}
+
+.rec-notes {
+  max-width: 720px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

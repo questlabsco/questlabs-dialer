@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#EEF0F6"/>
+    </linearGradient>
+    <linearGradient id="ql-grad" gradientUnits="userSpaceOnUse" x1="410" y1="396" x2="606" y2="528">
+      <stop offset="0" stop-color="#2D3BFF"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <mask id="ql-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="712" height="622">
+      <rect x="0" y="0" width="712" height="622" fill="#fff"/>
+      <polygon points="162,300 410,300 701,600 453,600" fill="#000"/>
+    </mask>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#tile)"/>
+  <rect x="64.5" y="64.5" width="895" height="895" rx="199.5" fill="none" stroke="#141821" stroke-opacity="0.10"/>
+  <!-- mark content box 516x452 scaled to ~600 wide, centred -->
+  <g transform="translate(512 512) scale(1.16) translate(-350 -322)">
+    <circle cx="318" cy="322" r="197" fill="none" stroke="#141821" stroke-width="56" mask="url(#ql-cut)"/>
+    <polygon points="250,365 321,365 479,528 408,528" fill="#141821"/>
+    <polygon points="410,396 478,396 606,528 538,528" fill="url(#ql-grad)"/>
+  </g>
+</svg>

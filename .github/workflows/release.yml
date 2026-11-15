@@ -1,0 +1,116 @@
+# Release pipeline: builds Quest Labs Dialer for Windows and macOS and publishes it to this
+# repository's GitHub Releases, which is both the auto-update feed and the download page.
+#
+# How to cut a release:
+#   1. Bump "version" in package.json (e.g. 1.0.1). Run `npm install` so package-lock.json matches.
+#   2. Optional local check: `npm run release:check` (typecheck, tests, Windows installer; no publishing).
+#   3. Commit:            git commit -am "Release 1.0.1"
+#   4. Tag the commit:    git tag v1.0.1        (must be "v" + the package.json version)
+#   5. Push both:         git push && git push origin v1.0.1
+# Pushing the tag starts this workflow. It creates a draft release for the tag, the Windows and
+# macOS jobs upload their files to that same draft, and once both have finished the release is
+# published (and marked latest). Installed Windows apps pick it up within a few hours; Mac users
+# see "New version available" and download it from the releases page.
+#
+# If a job fails, the release stays a draft (nothing reaches users). Fix, delete the draft and the
+# tag on GitHub, and tag again.
+#
+# Only the built-in GITHUB_TOKEN is used. The two VITE_ values below are the Supabase project URL and
+# its publishable (anon) key: public by design, they ship inside the app anyway.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  VITE_SUPABASE_URL: https://wmjfenlzmlbuasiukiyz.supabase.co
+  VITE_SUPABASE_ANON_KEY: sb_publishable_PaPNR0oqJ6qOilAEK_FVBg_GlfRtPCe
+
+jobs:
+  # One draft release for the tag, created up front so the two build jobs never race to create it.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the tag matches package.json
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${version} (expected v${version})."
+            exit 1
+          fi
+
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; the builds will upload to it."
+          else
+            gh release create "${GITHUB_REF_NAME}" --draft --verify-tag --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: --win
+          - os: macos-latest
+            platform: --mac
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build web app
+        run: npx vite build
+
+      # Uploads the installer(s), blockmaps and update metadata to the draft release above.
+      # Windows writes latest.yml, macOS writes latest-mac.yml (arm64 + x64 in one file), so the
+      # two jobs never overwrite each other's files.
+      - name: Build and upload
+        run: npx electron-builder ${{ matrix.platform }} --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No signing certificates: Windows is unsigned, macOS is ad-hoc signed (mac.identity "-").
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false --latest

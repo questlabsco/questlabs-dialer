@@ -1,0 +1,103 @@
+.settings-screen {
+  min-width: 0;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-7);
+  min-width: 0;
+  max-width: 1040px;
+}
+
+.set-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.set-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3) var(--space-6);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .set-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.set-num .input,
+.set-num .select {
+  max-width: 220px;
+}
+
+.set-wide {
+  grid-column: span 2;
+}
+
+.set-wide .input {
+  max-width: 520px;
+}
+
+.set-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-6);
+  margin-top: var(--space-1);
+}
+
+.set-example {
+  font-size: var(--font-xs);
+  color: var(--text-muted);
+}
+
+.script-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-6);
+  align-items: stretch;
+}
+
+@media (max-width: 1000px) {
+  .script-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.script-input {
+  font-size: var(--font-md);
+  min-height: 260px;
+}
+
+.script-preview-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.script-preview {
+  flex: 1;
+  min-height: 260px;
+  max-height: 400px;
+  overflow: auto;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+  font-size: var(--font-md);
+}
+
+.script-var {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-radius: 3px;
+  padding: 0 3px;
+  font-weight: 500;
+}

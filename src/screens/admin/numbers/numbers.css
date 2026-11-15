@@ -1,0 +1,475 @@
+.numbers-screen {
+  min-width: 0;
+}
+
+.numbers-screen .adm-callout {
+  align-items: center;
+  min-height: 40px;
+}
+
+.numbers-screen .adm-callout svg {
+  margin-top: 0;
+}
+
+.numbers-note {
+  font-size: var(--font-sm);
+}
+
+.num-cell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.num-strong {
+  font-weight: 500;
+}
+
+.num-critical {
+  color: var(--critical);
+  font-weight: 500;
+}
+
+.num-inline {
+  display: block;
+  height: var(--control-height-sm);
+  font-size: var(--font-sm);
+  border-color: transparent;
+  background: transparent;
+}
+
+.num-inline:hover {
+  border-color: var(--border-strong);
+}
+
+.num-inline:focus-visible {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+
+.num-inline[aria-invalid='true'] {
+  border-color: var(--critical);
+}
+
+/* The text lines up with the column header; the field outline appears on hover. */
+.num-label-input {
+  width: 148px;
+  margin-left: -11px;
+}
+
+.num-cap-input {
+  width: 72px;
+  margin-left: -11px;
+}
+
+.numbers-screen .table th,
+.numbers-screen .table td {
+  padding-right: var(--space-2);
+}
+
+.num-meter-cell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.num-meter {
+  width: 48px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-3);
+  overflow: hidden;
+  flex: none;
+}
+
+.num-meter-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+.num-meter.high .num-meter-fill {
+  background: var(--warning);
+}
+
+.num-meter.full .num-meter-fill {
+  background: var(--critical);
+}
+
+/* Toggle switch built on a native checkbox. */
+.num-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  position: relative;
+}
+
+.num-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 32px;
+  height: 18px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.num-switch-track {
+  width: 30px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--border-strong);
+  position: relative;
+  transition: background-color 0.12s;
+  flex: none;
+}
+
+.num-switch-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--surface);
+  transition: transform 0.12s;
+}
+
+.num-switch input:checked + .num-switch-track {
+  background: var(--accent);
+}
+
+.num-switch input:checked + .num-switch-track::after {
+  transform: translateX(14px);
+}
+
+.num-switch input:focus-visible + .num-switch-track {
+  box-shadow: var(--focus-ring);
+}
+
+.num-switch-text {
+  line-height: 1;
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+  min-width: 22px;
+}
+
+/* ---------- Phone setup (Telnyx) ---------- */
+
+.ps,
+.ps-numbers {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  font-size: var(--font-sm);
+  min-width: 0;
+}
+
+.ps-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px var(--space-3);
+  min-height: 44px;
+  padding: 6px var(--space-2) 6px var(--space-3);
+}
+
+.ps-title {
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+  font-size: var(--font-md);
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.ps-summary-wrap {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px var(--space-3);
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.ps-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-weight: 500;
+}
+
+.ps-summary svg,
+.ps-summary-warn svg {
+  flex: none;
+}
+
+.ps-summary-ok { color: var(--good); }
+.ps-summary-fail { color: var(--critical); }
+.ps-summary-info { color: var(--text); }
+.ps-summary-info svg { color: var(--text-muted); }
+
+.ps-summary-sub {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.ps-summary-warn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--warning);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.ps-checked {
+  color: var(--text-faint);
+  font-size: var(--font-xs);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.ps-actions {
+  flex: none;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ps-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.ps-text {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.ps-note {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: 820px;
+}
+
+.ps-steps {
+  margin: 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  line-height: 1.5;
+}
+
+.ps-steps li::marker {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.ps-code {
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 12px;
+  user-select: all;
+}
+
+.ps-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-text);
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ps-link:hover {
+  text-decoration: underline;
+}
+
+.ps-link:focus-visible {
+  outline: none;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--focus-ring);
+}
+
+/* Checklist: mark | label | detail (+ what to do). */
+.ps-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.ps-row {
+  display: grid;
+  grid-template-columns: 52px minmax(180px, 250px) minmax(0, 1fr);
+  align-items: start;
+  gap: 0 var(--space-3);
+  min-height: var(--row-height-dense);
+  padding: 7px var(--space-1);
+  line-height: 20px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.ps-row-fail {
+  background: var(--surface-2);
+}
+
+.ps-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+  font-size: var(--font-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.ps-mark svg {
+  flex: none;
+  align-self: center;
+}
+
+.ps-mark-ok { color: var(--good); }
+.ps-mark-fail { color: var(--critical); }
+.ps-mark-warn { color: var(--warning); }
+.ps-mark-info { color: var(--text-muted); }
+
+.ps-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.ps-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.ps-row-fail .ps-detail {
+  color: var(--text);
+}
+
+.ps-hint {
+  color: var(--text);
+}
+
+.ps-hint::before {
+  content: 'What to do: ';
+  font-weight: 600;
+}
+
+.ps-hint-plain {
+  color: var(--text-muted);
+}
+
+.ps-hint-plain::before {
+  content: none;
+}
+
+.ps-row-fail .ps-hint-plain {
+  color: var(--text);
+}
+
+.ps-strong {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Result of Set up Telnyx. */
+.ps-result {
+  max-width: 900px;
+}
+
+.ps-result-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.ps-result-label {
+  font-weight: 600;
+}
+
+/* Numbers on the Telnyx account. */
+.ps-numbers {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+}
+
+.ps-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ps-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-xs);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.ps-count {
+  font-weight: 500;
+  color: var(--text-faint);
+}
+
+.ps-table {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.ps-table td.ps-num {
+  width: 150px;
+  font-weight: 500;
+}
+
+.ps-table td.ps-msg {
+  white-space: normal;
+  color: var(--text-muted);
+}
+
+.ps-app {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.ps-refusal {
+  color: var(--critical);
+}
+
+.ps-buy {
+  color: var(--text-muted);
+}
+
+@media (max-width: 1100px) {
+  .ps-row {
+    grid-template-columns: 52px minmax(150px, 200px) minmax(0, 1fr);
+  }
+}

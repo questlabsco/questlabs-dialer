@@ -1,0 +1,36 @@
+# Dependencies and build output
+node_modules/
+dist/
+release/
+*.tsbuildinfo
+
+# Local environment files (keys, backend URLs). Only the empty template is committed.
+.env
+.env.*
+!.env.example
+
+# Secrets and signing material that must never reach the public repository
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.mobileprovision
+*.provisionprofile
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
+supabase/.env
+supabase/.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
