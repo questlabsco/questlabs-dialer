@@ -72,10 +72,23 @@ export interface Telephony {
   sendDigits(callId: string, digits: string): Promise<void>;
   /** Mutes / unmutes the caller's microphone on all calls. */
   setMuted(muted: boolean): Promise<void>;
-  /** Accepts an `incoming` call; emits `answered` for it. */
+  /** Accepts an `incoming` call; emits `answered` for it. Works while connected or on standby. */
   answerIncoming(callId: string): Promise<void>;
   /** Rejects an `incoming` call; emits `ended { reason: 'hangup_local' }`. */
   declineIncoming(callId: string): Promise<void>;
   /** Subscribe to all events. Returns unsubscribe. */
   on(listener: TelephonyListener): () => void;
+  /**
+   * Optional: stay reachable for `incoming` calls while signed in but not connected (no open call
+   * leg, no microphone). Called by the engine for a signed-in caller; never rejects. Answering an
+   * incoming call while only on standby asks for the microphone then.
+   */
+  startStandby?(): Promise<void>;
+  /** Optional: undo startStandby (sign-out). */
+  stopStandby?(): Promise<void>;
+  /**
+   * Optional: true when the provider records missed inbound calls itself (server side), so the
+   * engine must not log them again.
+   */
+  readonly logsMissedInbound?: boolean;
 }

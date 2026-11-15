@@ -49,17 +49,63 @@ export const AGENT_SESSION_HEADER = 'X-Quest-Agent-Session';
 /** Destination the WebRTC client "dials" for its agent leg; the leg is parked, so it is never routed. */
 export const AGENT_LEG_DESTINATION = 'quest-agent';
 
-/** Spoken to inbound callers nobody can take. */
-export const POLITE_MISSED_MESSAGE =
-  "Thanks for calling Quest Labs. We can't take your call right now, but we'll call you back shortly. Goodbye.";
+/** Custom SIP header on the leg the server rings a signed-in caller's app with (value: our offer id). */
+export const OFFER_HEADER = 'X-Quest-Offer';
 
-export const POLITE_VOICE = 'AWS.Polly.Joanna-Neural';
+/** `message` of an `incoming` event whose call rings the app itself (answer it with the SDK). */
+export const INCOMING_ON_DEVICE = 'device';
 
-/** Ringing time for an inbound call before the app declines it politely. */
-export const INBOUND_RING_SECONDS = 20;
+/** Offer id carried by an SDK call the server rang the app with (custom header, else client_state). */
+export function offerIdOfSdkCall(opts: { customHeaders?: { name?: string; value?: string }[] | null; clientState?: string | null } | null | undefined): string | null {
+  const h = opts?.customHeaders?.find((x) => String(x?.name ?? '').toLowerCase() === OFFER_HEADER.toLowerCase());
+  if (h && typeof h.value === 'string' && ID_RE.test(h.value)) return h.value;
+  const cs = decodeClientState(opts?.clientState);
+  return cs?.k === 'ring' ? cs.id : null;
+}
 
-/** Backstop on the Voice API app: Telnyx hangs up inbound calls that get no command in this time. */
-export const FIRST_COMMAND_TIMEOUT_SECS = 30;
+/**
+ * What a person calling back hears when nobody takes the call (speak command). One place for the
+ * text and the voice.
+ *
+ * Voice: Azure "Ava" Dragon HD, the most natural-sounding voice the Telnyx speak docs list, used
+ * here with the exact identifier from those docs
+ * (developers.telnyx.com/api-reference/call-commands/gather-using-speak, voice parameter:
+ * `Azure.en-US-Ava:DragonHDLatestNeural`). Azure voices need no `voice_settings` unless you bring
+ * your own Azure key. If Telnyx refuses it (for example, the account cannot use it), the webhook
+ * retries once with `fallbackVoice` (Amazon Polly neural), so the caller still hears the message.
+ */
+export const MISSED_CALLBACK_SPEECH = {
+  text: "Thanks for calling back. Sorry we missed you. We'll try you again shortly.",
+  voice: 'Azure.en-US-Ava:DragonHDLatestNeural',
+  fallbackVoice: 'AWS.Polly.Joanna-Neural',
+  language: 'en-US',
+} as const;
+
+/** Body for POST /calls/{id}/actions/speak with the missed-callback message. */
+export function missedCallbackSpeakBody(clientState: string, useFallbackVoice = false): Record<string, unknown> {
+  return {
+    payload: MISSED_CALLBACK_SPEECH.text,
+    payload_type: 'text',
+    voice: useFallbackVoice ? MISSED_CALLBACK_SPEECH.fallbackVoice : MISSED_CALLBACK_SPEECH.voice,
+    language: MISSED_CALLBACK_SPEECH.language,
+    client_state: clientState,
+  };
+}
+
+/** How long the caller who last called the number gets the callback to themselves. */
+export const INBOUND_FIRST_OFFER_SECONDS = 15;
+
+/** After this long with nobody answering, the caller hears MISSED_CALLBACK_SPEECH. */
+export const INBOUND_TOTAL_RING_SECONDS = 30;
+
+/** App-side backstop: an offer still ringing this long is declined by the app (the server normally ends it first). */
+export const INBOUND_RING_SECONDS = 35;
+
+/**
+ * Backstop on the Voice API app: Telnyx hangs up inbound calls that get no command in this time.
+ * Longer than INBOUND_TOTAL_RING_SECONDS so the missed-call message can always be played.
+ */
+export const FIRST_COMMAND_TIMEOUT_SECS = 45;
 
 // ---------------------------------------------------------------------------
 // client_state (Base64 JSON carried on every Telnyx command and echoed on every webhook)
@@ -74,7 +120,12 @@ export type ClientState =
    */
   | { v: 1; k: 'in'; id: string; st?: 'bridge' | 'polite' }
   /** The caller's long-lived WebRTC agent leg. `sid` = agent_sessions.id. */
-  | { v: 1; k: 'agent'; sid: string };
+  | { v: 1; k: 'agent'; sid: string }
+  /**
+   * A leg the server rings a signed-in caller's app with, to offer them an inbound call.
+   * `id` = the offer (telephony_calls.id of the offer row), `p` = the inbound call (parent row).
+   */
+  | { v: 1; k: 'ring'; id: string; p: string };
 
 function utf8ToBase64(text: string): string {
   const bytes = new TextEncoder().encode(text);
@@ -115,7 +166,184 @@ export function decodeClientState(raw: unknown): ClientState | null {
     return null;
   }
   if (o.k === 'agent' && typeof o.sid === 'string' && ID_RE.test(o.sid)) return { v: 1, k: 'agent', sid: o.sid };
+  if (o.k === 'ring' && typeof o.id === 'string' && ID_RE.test(o.id) && typeof o.p === 'string' && ID_RE.test(o.p)) {
+    return { v: 1, k: 'ring', id: o.id, p: o.p };
+  }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Inbound call routing (callbacks)
+// ---------------------------------------------------------------------------
+//
+// One inbound call (the PSTN leg) is one "parent" telephony_calls row. Each caller it is offered to
+// gets an "offer" row of their own (direction 'inbound', caller_id = that caller), because the app
+// identifies a call by an id only it sees events for. Offer rows carry `call_session_id =
+// offerTag(parentId)`. Ids are derived deterministically so an offer can never be created twice.
+
+/** Deterministic uuid-shaped id from `parts` (not a secret; only used to make inserts idempotent). */
+export function derivedId(...parts: string[]): string {
+  const text = parts.join('\u0001');
+  // cyrb128: four 32-bit lanes.
+  let h1 = 1779033703,
+    h2 = 3144134277,
+    h3 = 1013904242,
+    h4 = 2773480762;
+  for (let i = 0; i < text.length; i++) {
+    const k = text.charCodeAt(i);
+    h1 = h2 ^ Math.imul(h1 ^ k, 597399067);
+    h2 = h3 ^ Math.imul(h2 ^ k, 2869860233);
+    h3 = h4 ^ Math.imul(h3 ^ k, 951274213);
+    h4 = h1 ^ Math.imul(h4 ^ k, 2716044179);
+  }
+  h1 = Math.imul(h3 ^ (h1 >>> 18), 597399067);
+  h2 = Math.imul(h4 ^ (h2 >>> 22), 2869860233);
+  h3 = Math.imul(h1 ^ (h3 >>> 17), 951274213);
+  h4 = Math.imul(h2 ^ (h4 >>> 19), 2716044179);
+  h1 ^= h2 ^ h3 ^ h4;
+  h2 ^= h1;
+  h3 ^= h1;
+  h4 ^= h1;
+  const hex = [h1, h2, h3, h4].map((h) => (h >>> 0).toString(16).padStart(8, '0')).join('');
+  // Shape as a version-4 / RFC 4122 variant uuid so every uuid parser accepts it.
+  const v = `${hex.slice(0, 12)}4${hex.slice(13, 16)}${((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16)}${hex.slice(17)}`;
+  return `${v.slice(0, 8)}-${v.slice(8, 12)}-${v.slice(12, 16)}-${v.slice(16, 20)}-${v.slice(20, 32)}`;
+}
+
+/** The offer row id of inbound call `parentId` for `callerId`. */
+export function offerIdFor(parentId: string, callerId: string): string {
+  return derivedId('offer', parentId, callerId);
+}
+
+/** The agent_sessions id used when an offer rings the caller's app directly (no live dialing line). */
+export function ringSessionIdFor(offerId: string): string {
+  return derivedId('ring-session', offerId);
+}
+
+const OFFER_TAG_PREFIX = 'offer:';
+
+/** Stored in the offer row's call_session_id: links it to its parent. */
+export function offerTag(parentId: string): string {
+  return OFFER_TAG_PREFIX + parentId;
+}
+
+/** Parent id of an offer row (from its call_session_id), or null when the row is not an offer. */
+export function parentOfOfferTag(callSessionId: unknown): string | null {
+  if (typeof callSessionId !== 'string' || !callSessionId.startsWith(OFFER_TAG_PREFIX)) return null;
+  const id = callSessionId.slice(OFFER_TAG_PREFIX.length);
+  return ID_RE.test(id) ? id : null;
+}
+
+/** SIP URI of a caller's registered WebRTC client (the telephony credential's sip_username). */
+export function sipUriForUsername(sipUsername: string): string {
+  return `sip:${sipUsername}@sip.telnyx.com`;
+}
+
+export type PresenceStatusLite = 'offline' | 'idle' | 'dialing' | 'on_call' | 'wrap_up' | 'paused';
+
+/** Presence older than this is offline (matches list_presence in 0001_core.sql). */
+export const PRESENCE_STALE_MS = 90_000;
+
+export interface InboundCandidate {
+  callerId: string;
+  /** presence.status, or null when there is no row. */
+  presence: PresenceStatusLite | null;
+  /** presence.updated_at (ISO), or null. */
+  presenceUpdatedAt: string | null;
+  /** A live agent session (the caller is dialing / paused with an open line), or null. */
+  liveAgentSessionId: string | null;
+  /** sip_username of the caller's telephony credential, or null (never logged in to calling). */
+  sipUsername: string | null;
+  /** Already on an inbound/outbound call that is answered or being answered, or ringing with another offer. */
+  busy: boolean;
+}
+
+export type InboundOffer =
+  /** The caller is dialing / paused: offer through the app; answering bridges to their open line. */
+  | { callerId: string; via: 'agent_leg'; agentSessionId: string }
+  /** The caller is signed in but not dialing: ring their registered app directly. */
+  | { callerId: string; via: 'sip'; sipUsername: string };
+
+/** How a candidate can be offered a call right now, or null if they cannot take one. */
+export function offerFor(c: InboundCandidate, nowMs: number): InboundOffer | null {
+  if (c.busy || !c.presence || !c.presenceUpdatedAt) return null;
+  const at = Date.parse(c.presenceUpdatedAt);
+  if (!Number.isFinite(at) || nowMs - at > PRESENCE_STALE_MS) return null;
+  if (c.presence !== 'idle' && c.presence !== 'paused' && c.presence !== 'dialing') return null;
+  if (c.liveAgentSessionId) return { callerId: c.callerId, via: 'agent_leg', agentSessionId: c.liveAgentSessionId };
+  if (c.sipUsername) return { callerId: c.callerId, via: 'sip', sipUsername: c.sipUsername };
+  return null;
+}
+
+export interface InboundPlan {
+  /** The caller who last called this number, alone, when free (rule: they get it first). */
+  first: InboundOffer[];
+  /** Everyone else who is free (offered together; the first to answer gets the call). */
+  others: InboundOffer[];
+}
+
+export function planInboundRouting(input: {
+  preferredCallerId: string | null;
+  candidates: InboundCandidate[];
+  nowMs: number;
+  /** Callers already offered this call (never offered twice). */
+  alreadyOffered?: ReadonlySet<string>;
+}): InboundPlan {
+  const done = input.alreadyOffered ?? new Set<string>();
+  const seen = new Set<string>();
+  const first: InboundOffer[] = [];
+  const others: InboundOffer[] = [];
+  const sorted = [...input.candidates].sort((a, b) => (a.callerId < b.callerId ? -1 : a.callerId > b.callerId ? 1 : 0));
+  for (const c of sorted) {
+    if (seen.has(c.callerId) || done.has(c.callerId)) continue;
+    seen.add(c.callerId);
+    const o = offerFor(c, input.nowMs);
+    if (!o) continue;
+    if (c.callerId === input.preferredCallerId) first.push(o);
+    else others.push(o);
+  }
+  return { first, others };
+}
+
+export type InboundStep = 'wait' | 'offer_others' | 'fallback';
+
+/**
+ * What to do next with an inbound call nobody has answered yet.
+ * - Offers still ringing: wait.
+ * - The "everyone else" round has not happened and there is time left: offer the others.
+ * - Otherwise: play the missed-call message.
+ */
+export function nextInboundStep(p: { elapsedMs: number; othersOffered: boolean; ringingOffers: number }): InboundStep {
+  if (p.ringingOffers > 0) return 'wait';
+  if (!p.othersOffered && p.elapsedMs < (INBOUND_TOTAL_RING_SECONDS - 5) * 1000) return 'offer_others';
+  return 'fallback';
+}
+
+/** Ring time for the "everyone else" round: what is left of INBOUND_TOTAL_RING_SECONDS (min 5 s). */
+export function othersRingSeconds(elapsedMs: number): number {
+  return Math.max(5, Math.round(INBOUND_TOTAL_RING_SECONDS - elapsedMs / 1000));
+}
+
+/** Body for POST /v2/calls ringing a caller's registered app with an inbound offer. */
+export function buildRingBody(i: {
+  voiceAppId: string;
+  sipUsername: string;
+  /** Our number the person called (always a valid caller id on the account). */
+  from: string;
+  offerId: string;
+  parentId: string;
+  ringSeconds: number;
+}): Record<string, unknown> {
+  return {
+    connection_id: i.voiceAppId,
+    to: sipUriForUsername(i.sipUsername),
+    from: i.from,
+    timeout_secs: clampRingSeconds(i.ringSeconds, INBOUND_FIRST_OFFER_SECONDS),
+    time_limit_secs: 3600,
+    custom_headers: [{ name: OFFER_HEADER, value: i.offerId }],
+    client_state: encodeClientState({ v: 1, k: 'ring', id: i.offerId, p: i.parentId }),
+    command_id: `ring-${i.offerId}`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +713,7 @@ export type StatusKey =
   | 'webrtc_connection'
   | 'webrtc_webhook'
   | 'webrtc_parking'
+  | 'webrtc_inbound'
   | 'webrtc_profile'
   | 'webhook_public_key'
   | 'numbers';
@@ -511,6 +740,8 @@ export interface StatusFacts {
     apiVersion: string | null;
     parking: boolean;
     profileId: string | null;
+    /** sip_uri_calling_preference: must be 'internal' (or 'unrestricted') so callbacks can ring the app. */
+    sipUriCalling?: string | null;
   } | null;
   outboundProfile: { id: string; name: string } | null;
   publicKeyPresent: boolean;
@@ -573,6 +804,19 @@ export function evaluateStatus(f: StatusFacts): StatusItem[] {
       cc.parking ? 'Enabled.' : 'Disabled: the callers\' audio legs would not be held for bridging.',
       RUN_SETUP,
     );
+    // Only judged when reported (telnyx-status always reports it; older callers of this function may not).
+    if (cc.sipUriCalling !== undefined) {
+      const inboundOk = cc.sipUriCalling === 'internal' || cc.sipUriCalling === 'unrestricted';
+      add(
+        'webrtc_inbound',
+        'Callbacks ring the app',
+        inboundOk,
+        inboundOk
+          ? 'On: people calling back ring callers who are signed in.'
+          : 'Off: people calling back can only reach callers who are dialing.',
+        RUN_SETUP,
+      );
+    }
     add(
       'webrtc_profile',
       'WebRTC outbound profile',

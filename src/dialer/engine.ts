@@ -6,7 +6,10 @@
  * - Double ring: a missed ring 1 is immediately re-rung as ring 2 from the same outbound number.
  * - Each lead has up to 3 phones, tried in order; once all are used the lead gets a missed day.
  * - Voicemail is detected on the active call and skipped like a missed ring.
- * - Inbound calls (leads calling back) are offered to the caller between calls.
+ * - Inbound calls (people calling back) are offered to the caller whenever they are free: idle,
+ *   dialing (between calls) or paused. With `standby` the telephony stays reachable while idle.
+ *   Answered from idle the call opens no session; afterwards the dialer returns to idle (after the
+ *   wrap-up for a known lead). From paused it returns to paused, from dialing it keeps dialing.
  * - Manual calls (callNumber): one number typed by the caller, rung once while idle or paused. From
  *   idle the audio session is opened for that call only; afterwards the dialer returns to where it
  *   was. Known leads get a wrap-up (no queue lock, no missed day); other numbers do not.
@@ -38,6 +41,11 @@ export interface DialerEngineDeps {
   telephony: Telephony;
   /** Clock in ms; injectable for tests. Default Date.now. */
   now?: () => number;
+  /**
+   * Keep the caller reachable for inbound calls while not dialing (Telephony.startStandby), from
+   * construction until dispose(). The app sets this for the signed-in caller.
+   */
+  standby?: boolean;
 }
 
 export type DialerListener = (state: DialerState) => void;
@@ -188,6 +196,9 @@ export class DialerEngine implements DialerControls {
   private wrap: WrapUp | null = null;
   private pending: Pending | null = null;
   private manual: Manual | null = null;
+  /** An inbound call was answered while idle: return to idle once it (and its wrap-up) is done. */
+  private inboundFromIdle = false;
+  private readonly standby: boolean;
   private stopRequested = false;
   /** Fatal error raised during a call; applied once the wrap-up is done. */
   private fatalAfterWrapUp: string | null = null;
@@ -208,9 +219,17 @@ export class DialerEngine implements DialerControls {
     this.api = deps.api;
     this.telephony = deps.telephony;
     this.now = deps.now ?? (() => Date.now());
+    this.standby = !!deps.standby;
     this.unsubscribeTelephony = this.telephony.on((event) => {
       void this.run(() => this.handleEvent(event)).catch((e) => warn(`handling ${event.type}`, e));
     });
+    if (this.standby) {
+      void this.run(async () => {
+        if (this.disposed) return;
+        if (this.state.phase === 'idle') this.presence('idle');
+        if (this.telephony.startStandby) await this.safe('standby', this.telephony.startStandby());
+      });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -262,6 +281,7 @@ export class DialerEngine implements DialerControls {
         this.wrap = null;
       }
       await this.finalStop();
+      if (this.standby && this.telephony.stopStandby) await this.safe('standby', this.telephony.stopStandby());
       this.disposed = true;
     });
     this.unsubscribeTelephony();
@@ -271,6 +291,7 @@ export class DialerEngine implements DialerControls {
   start(): Promise<void> {
     return this.control(async () => {
       if (this.state.phase !== 'idle' && this.state.phase !== 'error') return;
+      if (this.pending) throw new Error(MANUAL_DURING_INCOMING_MESSAGE);
       this.resetInternals();
       this.commit({
         ...INITIAL_DIALER_STATE,
@@ -429,6 +450,7 @@ export class DialerEngine implements DialerControls {
       await this.release(ids);
       this.clearPoll();
       if (this.state.phase === 'paused') this.commit({ pauseRequested: true });
+      if (this.state.phase === 'idle') this.inboundFromIdle = true;
       p.answering = true;
       this.commit({ queueEmpty: false });
       try {
@@ -436,10 +458,14 @@ export class DialerEngine implements DialerControls {
       } catch (e) {
         warn('answer incoming', e);
         this.detach(p.callId);
-        this.pending = null;
+        if (this.pending === p) this.pending = null;
+        // Hand the call on (to someone else / the missed-call message) instead of leaving it ringing.
+        await this.safe('decline incoming', this.telephony.declineIncoming(p.callId));
         await this.logMissedInbound(p);
         this.commit();
         await this.afterIncomingCleared();
+        // Shown to the caller (e.g. microphone blocked).
+        throw new Error(`Couldn't answer: ${errorMessage(e)}`);
       }
     });
   }
@@ -689,6 +715,7 @@ export class DialerEngine implements DialerControls {
     this.pending = null;
     if (this.manual?.timer) clearTimeout(this.manual.timer);
     this.manual = null;
+    this.inboundFromIdle = false;
     this.stopRequested = false;
     this.fatalAfterWrapUp = null;
   }
@@ -1012,6 +1039,11 @@ export class DialerEngine implements DialerControls {
       case 'incoming':
         return this.onIncoming(e.callId, e.from, e.to);
       case 'error':
+        // While idle there is nothing to stop (standby reconnects by itself).
+        if (this.state.phase === 'idle' && !this.active) {
+          warn('telephony', e.message);
+          return;
+        }
         return this.enterFatal(e.message || 'The phone connection failed.');
     }
   }
@@ -1150,7 +1182,8 @@ export class DialerEngine implements DialerControls {
 
   private async onIncoming(callId: string, from: string, to: string): Promise<void> {
     const phase = this.state.phase;
-    const canOffer = (phase === 'dialing' || phase === 'paused') && !this.active && !this.wrap && !this.pending && !this.manual;
+    const canOffer =
+      (phase === 'dialing' || phase === 'paused' || phase === 'idle') && !this.active && !this.wrap && !this.pending && !this.manual;
     const lead = (await this.safe('finding lead', this.api.findLeadByPhone(from))) ?? null;
     if (!canOffer) {
       await this.safe('decline incoming', this.telephony.declineIncoming(callId));
@@ -1179,6 +1212,8 @@ export class DialerEngine implements DialerControls {
       }),
     );
     this.pending = null;
+    // From idle: one (never filled) line, so a running state always has lines (as for manual calls).
+    if (this.inboundFromIdle && this.slots.length === 0) this.slots = [emptySlot(0)];
     this.active = {
       callId: p.callId,
       callRecordId: rec?.id ?? '',
@@ -1223,6 +1258,8 @@ export class DialerEngine implements DialerControls {
   }
 
   private async logMissedInbound(p: Pending): Promise<void> {
+    // The provider records missed inbound calls itself (one row per call, not per caller offered).
+    if (this.telephony.logsMissedInbound) return;
     await this.safe(
       'logging missed inbound',
       this.api.createCall({
@@ -1239,6 +1276,8 @@ export class DialerEngine implements DialerControls {
   }
 
   private async afterIncomingCleared(): Promise<void> {
+    // The incoming call never connected: an answer from idle no longer needs a way back.
+    this.inboundFromIdle = false;
     // answerIncoming() from paused sets pauseRequested; the call never connected, so drop it.
     if (this.state.phase === 'paused' && this.state.pauseRequested) this.commit({ pauseRequested: false });
     if (this.state.phase === 'dialing') await this.fill();
@@ -1370,6 +1409,12 @@ export class DialerEngine implements DialerControls {
   private async afterCallDone(): Promise<void> {
     if (this.manual) {
       await this.finishManual();
+      return;
+    }
+    if (this.inboundFromIdle && !this.fatalAfterWrapUp) {
+      // A call answered while idle: back to idle (no session was opened for it).
+      this.inboundFromIdle = false;
+      await this.finalStop();
       return;
     }
     if (this.stopRequested) {

@@ -1,9 +1,11 @@
 /**
  * Thin wrapper around @telnyx/webrtc for the caller's single "agent leg": log in with a JWT, place
  * one parked call on the dialer's credential connection, play remote audio, mute and send DTMF.
+ * While logged in the client is also registered for calls TO it: the server rings it with a
+ * callback (Voice API dial to sip:<sip_username>@sip.telnyx.com); those surface via onIncomingCall.
  * Kept behind a small interface so TelnyxTelephony can be unit-tested without the SDK or a DOM.
  */
-import { AGENT_LEG_DESTINATION, AGENT_SESSION_HEADER } from '../../supabase/functions/_shared/telnyxLogic';
+import { AGENT_LEG_DESTINATION, AGENT_SESSION_HEADER, offerIdOfSdkCall } from '../../supabase/functions/_shared/telnyxLogic';
 
 export interface RtcAgentCall {
   /** Resolves when the SDK reports the call active (the server answered the parked leg). */
@@ -13,9 +15,27 @@ export interface RtcAgentCall {
   hangup(): Promise<void>;
 }
 
+/** A call ringing this client (a callback offer from the server). */
+export interface RtcInboundCall {
+  readonly id: string;
+  /** Our offer id (from the X-Quest-Offer header / client_state), or null if it carries none. */
+  readonly offerId: string | null;
+  readonly ended: boolean;
+  /** Answers with audio (the caller must already have allowed the microphone). */
+  answer(muted: boolean): Promise<void>;
+  setMuted(muted: boolean): void;
+  dtmf(digits: string): void;
+  /** Rejects (while ringing) or hangs up. */
+  hangup(): Promise<void>;
+  /** Called once when the call ends for any reason. */
+  onEnded(cb: () => void): void;
+}
+
 export interface RtcCallbacks {
   /** A failure that ends the WebRTC session (auth rejected, gave up reconnecting...). */
   onFatal(message: string, kind: 'auth' | 'network' | 'other'): void;
+  /** A call is ringing this client. */
+  onIncomingCall?(call: RtcInboundCall): void;
 }
 
 export interface StartAgentLegOptions {
@@ -38,6 +58,9 @@ export type RtcFactory = (callbacks: RtcCallbacks) => RtcClient;
 interface SdkCall {
   id: string;
   state: string;
+  direction?: string;
+  options?: { customHeaders?: { name?: string; value?: string }[]; clientState?: string };
+  answer?(params?: Record<string, unknown>): Promise<void> | void;
   cause?: string;
   causeCode?: number;
   muteAudio(): void;
@@ -56,9 +79,8 @@ interface SdkClient {
 
 const CONNECT_TIMEOUT_MS = 15_000;
 
-function remoteAudioElement(): HTMLAudioElement | null {
+function remoteAudioElement(id = 'quest-telnyx-remote-audio'): HTMLAudioElement | null {
   if (typeof document === 'undefined') return null;
-  const id = 'quest-telnyx-remote-audio';
   let el = document.getElementById(id) as HTMLAudioElement | null;
   if (!el) {
     el = document.createElement('audio');
@@ -90,7 +112,56 @@ export const createTelnyxRtc: RtcFactory = (callbacks) => {
 
   const onNotification = (n: { type?: string; call?: SdkCall }) => {
     if (n?.type !== 'callUpdate' || !n.call) return;
-    calls.get(n.call.id)?.onUpdate(n.call);
+    const known = calls.get(n.call.id);
+    if (known) {
+      known.onUpdate(n.call);
+      return;
+    }
+    if (n.call.direction === 'inbound' && (n.call.state === 'ringing' || n.call.state === 'new')) trackInbound(n.call);
+  };
+
+  const trackInbound = (sdk: SdkCall) => {
+    let ended = false;
+    const endedCbs: (() => void)[] = [];
+    const inbound: RtcInboundCall = {
+      id: sdk.id,
+      offerId: offerIdOfSdkCall(sdk.options),
+      get ended() {
+        return ended;
+      },
+      async answer(muted) {
+        if (ended) throw new Error('The call has already ended.');
+        if (!sdk.answer) throw new Error('This phone library cannot answer calls.');
+        const el = remoteAudioElement('quest-telnyx-remote-audio-in');
+        await sdk.answer({ audio: true, video: false, ...(el ? { remoteElement: el } : {}) });
+        if (muted) sdk.muteAudio();
+      },
+      setMuted(muted) {
+        if (muted) sdk.muteAudio();
+        else sdk.unmuteAudio();
+      },
+      dtmf(digits) {
+        for (const d of digits) sdk.dtmf(d);
+      },
+      async hangup() {
+        if (!ended) await sdk.hangup().catch(() => {});
+      },
+      onEnded(cb) {
+        if (ended) cb();
+        else endedCbs.push(cb);
+      },
+    };
+    calls.set(sdk.id, {
+      call: sdk,
+      onUpdate: (c) => {
+        if ((c.state === 'hangup' || c.state === 'destroy') && !ended) {
+          ended = true;
+          calls.delete(c.id);
+          for (const cb of endedCbs.splice(0)) cb();
+        }
+      },
+    });
+    callbacks.onIncomingCall?.(inbound);
   };
   const onError = (e: unknown) => {
     if (!ready) return; // handled by connect()'s own listener

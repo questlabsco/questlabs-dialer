@@ -45,6 +45,7 @@ interface CredConn extends Named {
   webhook_event_url?: string | null;
   webhook_api_version?: string | null;
   outbound?: { call_parking_enabled?: boolean | null; outbound_voice_profile_id?: string | null } | null;
+  sip_uri_calling_preference?: string | null;
 }
 interface Ovp extends Named {
   name: string;
@@ -145,11 +146,14 @@ serve(async (req) => {
     }
 
     // ---- Credential connection for the callers' WebRTC audio legs (parked outbound calls).
+    // sip_uri_calling_preference 'internal': only connections on THIS account may call the callers'
+    // apps by SIP URI. Callbacks use it: the Voice API app rings sip:<gencred...>@sip.telnyx.com
+    // (Telnyx WebRTC "Pattern 2", developers.telnyx.com/docs/voice/webrtc/auth/credential-connections).
     const connWanted = {
       active: true,
       webhook_event_url: hook,
       webhook_api_version: '2',
-      sip_uri_calling_preference: 'disabled',
+      sip_uri_calling_preference: 'internal',
       outbound: { call_parking_enabled: true, outbound_voice_profile_id: ovp.id },
     };
     let conn = await getById<CredConn>('/credential_connections', prev?.credential_connection_id ?? null);
@@ -174,6 +178,7 @@ serve(async (req) => {
         conn.webhook_event_url !== hook ||
         String(conn.webhook_api_version) !== '2' ||
         conn.outbound?.call_parking_enabled !== true ||
+        conn.sip_uri_calling_preference !== 'internal' ||
         conn.outbound?.outbound_voice_profile_id !== ovp.id;
       if (drift) {
         const res = await telnyx<{ data: CredConn }>(

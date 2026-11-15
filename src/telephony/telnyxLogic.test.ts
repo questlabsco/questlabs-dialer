@@ -4,6 +4,22 @@ import {
   AGENT_SESSION_HEADER,
   base64ToBytes,
   buildDialBody,
+  buildRingBody,
+  derivedId,
+  INBOUND_FIRST_OFFER_SECONDS,
+  INBOUND_TOTAL_RING_SECONDS,
+  MISSED_CALLBACK_SPEECH,
+  missedCallbackSpeakBody,
+  nextInboundStep,
+  offerFor,
+  offerIdFor,
+  offerIdOfSdkCall,
+  offerTag,
+  othersRingSeconds,
+  parentOfOfferTag,
+  planInboundRouting,
+  ringSessionIdFor,
+  type InboundCandidate,
   clampRingSeconds,
   classifyNumbers,
   decodeClientState,
@@ -40,6 +56,7 @@ describe('client_state', () => {
       { v: 1, k: 'in', id: ID, st: 'bridge' },
       { v: 1, k: 'in', id: ID, st: 'polite' },
       { v: 1, k: 'agent', sid: ID },
+      { v: 1, k: 'ring', id: ID, p: ID },
     ] as const) {
       const enc = encodeClientState(s);
       expect(enc).toMatch(/^[A-Za-z0-9+/]+=*$/);
@@ -57,6 +74,7 @@ describe('client_state', () => {
     expect(decodeClientState(btoa(JSON.stringify({ v: 1, k: 'out', id: "x'; drop" })))).toBeNull();
     expect(decodeClientState(btoa(JSON.stringify({ v: 1, k: 'in', id: ID, st: 'weird' })))).toBeNull();
     expect(decodeClientState(btoa(JSON.stringify({ v: 1, k: 'other', id: ID })))).toBeNull();
+    expect(decodeClientState(btoa(JSON.stringify({ v: 1, k: 'ring', id: ID })))).toBeNull();
     // Telnyx docs' example client_state ("have a nice day") is not ours.
     expect(decodeClientState('aGF2ZSBhIG5pY2UgZGF5ID1d')).toBeNull();
   });
@@ -422,9 +440,159 @@ describe('evaluateStatus', () => {
     for (const i of items.filter((x) => !x.ok)) expect(i.hint).toBeTruthy();
   });
 
+  it('flags callbacks that cannot ring the app (SIP URI calling off) only when reported', () => {
+    const off = evaluateStatus({ ...good, credentialConnection: { ...good.credentialConnection!, sipUriCalling: 'disabled' } });
+    expect(off.filter((i) => !i.ok).map((i) => i.key)).toEqual(['webrtc_inbound']);
+    const on = evaluateStatus({ ...good, credentialConnection: { ...good.credentialConnection!, sipUriCalling: 'internal' } });
+    expect(on.find((i) => i.key === 'webrtc_inbound')!.ok).toBe(true);
+    expect(evaluateStatus(good).some((i) => i.key === 'webrtc_inbound')).toBe(false);
+  });
+
   it('reports missing resources', () => {
     const items = evaluateStatus({ ...good, voiceApp: null, credentialConnection: null, publicKeyPresent: false });
     const bad = items.filter((i) => !i.ok).map((i) => i.key);
     expect(bad).toEqual(['voice_app', 'webrtc_connection', 'webhook_public_key']);
+  });
+});
+
+describe('inbound ids and tags', () => {
+  const P = '11111111-2222-4333-8444-555555555555';
+  it('derives stable, uuid-shaped, distinct ids', () => {
+    const a = offerIdFor(P, 'caller-a');
+    expect(a).toBe(offerIdFor(P, 'caller-a'));
+    expect(a).not.toBe(offerIdFor(P, 'caller-b'));
+    expect(a).not.toBe(offerIdFor(ID, 'caller-a'));
+    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(ringSessionIdFor(a)).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(ringSessionIdFor(a)).not.toBe(a);
+    const many = new Set(Array.from({ length: 2000 }, (_, i) => derivedId('x', String(i))));
+    expect(many.size).toBe(2000);
+  });
+
+  it('links an offer to its parent through call_session_id', () => {
+    expect(parentOfOfferTag(offerTag(P))).toBe(P);
+    expect(parentOfOfferTag('v3:telnyx-session')).toBeNull();
+    expect(parentOfOfferTag(null)).toBeNull();
+    expect(parentOfOfferTag("offer:x'; drop")).toBeNull();
+  });
+
+  it('reads the offer id of an SDK call from the header or the client_state', () => {
+    expect(offerIdOfSdkCall({ customHeaders: [{ name: 'x-quest-offer', value: ID }] })).toBe(ID);
+    expect(offerIdOfSdkCall({ clientState: encodeClientState({ v: 1, k: 'ring', id: ID, p: P }) })).toBe(ID);
+    expect(offerIdOfSdkCall({ clientState: encodeClientState({ v: 1, k: 'agent', sid: ID }) })).toBeNull();
+    expect(offerIdOfSdkCall({ customHeaders: [{ name: 'X-Quest-Offer', value: 'bad value!' }] })).toBeNull();
+    expect(offerIdOfSdkCall(undefined)).toBeNull();
+  });
+});
+
+describe('inbound routing', () => {
+  const P = '11111111-2222-4333-8444-555555555555';
+  const NOW = Date.parse('2026-11-15T15:00:00Z');
+  const fresh = new Date(NOW - 20_000).toISOString();
+  const stale = new Date(NOW - 120_000).toISOString();
+  const cand = (p: Partial<InboundCandidate> & { callerId: string }): InboundCandidate => ({
+    presence: 'idle',
+    presenceUpdatedAt: fresh,
+    liveAgentSessionId: null,
+    sipUsername: `gencred${p.callerId}`,
+    busy: false,
+    ...p,
+  });
+
+  it('who can take a call, and how it reaches them', () => {
+    expect(offerFor(cand({ callerId: 'a' }), NOW)).toEqual({ callerId: 'a', via: 'sip', sipUsername: 'gencreda' });
+    expect(offerFor(cand({ callerId: 'a', presence: 'paused', liveAgentSessionId: 's1' }), NOW)).toEqual({
+      callerId: 'a',
+      via: 'agent_leg',
+      agentSessionId: 's1',
+    });
+    expect(offerFor(cand({ callerId: 'a', presence: 'dialing', liveAgentSessionId: 's1' }), NOW)?.via).toBe('agent_leg');
+    // Not signed in / app closed (stale heartbeat), on a call, wrapping up, busy, never logged in to calling.
+    expect(offerFor(cand({ callerId: 'a', presence: 'offline' }), NOW)).toBeNull();
+    expect(offerFor(cand({ callerId: 'a', presence: null, presenceUpdatedAt: null }), NOW)).toBeNull();
+    expect(offerFor(cand({ callerId: 'a', presenceUpdatedAt: stale }), NOW)).toBeNull();
+    expect(offerFor(cand({ callerId: 'a', presence: 'on_call' }), NOW)).toBeNull();
+    expect(offerFor(cand({ callerId: 'a', presence: 'wrap_up' }), NOW)).toBeNull();
+    expect(offerFor(cand({ callerId: 'a', busy: true }), NOW)).toBeNull();
+    expect(offerFor(cand({ callerId: 'a', sipUsername: null }), NOW)).toBeNull();
+  });
+
+  it('the last caller of the number gets it first, alone; everyone else free is the second round', () => {
+    const plan = planInboundRouting({
+      preferredCallerId: 'b',
+      nowMs: NOW,
+      candidates: [cand({ callerId: 'c' }), cand({ callerId: 'b' }), cand({ callerId: 'a', presence: 'on_call' }), cand({ callerId: 'd', presence: 'dialing', liveAgentSessionId: 's' })],
+    });
+    expect(plan.first.map((o) => o.callerId)).toEqual(['b']);
+    expect(plan.others.map((o) => o.callerId)).toEqual(['c', 'd']);
+  });
+
+  it('skips straight to everyone else when the last caller cannot take it or is unknown', () => {
+    const busy = planInboundRouting({
+      preferredCallerId: 'b',
+      nowMs: NOW,
+      candidates: [cand({ callerId: 'b', presence: 'wrap_up' }), cand({ callerId: 'c' })],
+    });
+    expect(busy.first).toEqual([]);
+    expect(busy.others.map((o) => o.callerId)).toEqual(['c']);
+    const unknown = planInboundRouting({ preferredCallerId: null, nowMs: NOW, candidates: [cand({ callerId: 'c' })] });
+    expect(unknown.first).toEqual([]);
+    expect(unknown.others.map((o) => o.callerId)).toEqual(['c']);
+    const nobody = planInboundRouting({ preferredCallerId: 'b', nowMs: NOW, candidates: [cand({ callerId: 'b', presence: 'offline' })] });
+    expect(nobody).toEqual({ first: [], others: [] });
+  });
+
+  it('never offers the same caller twice', () => {
+    const plan = planInboundRouting({
+      preferredCallerId: 'b',
+      nowMs: NOW,
+      candidates: [cand({ callerId: 'b' }), cand({ callerId: 'c' }), cand({ callerId: 'c' })],
+      alreadyOffered: new Set(['b']),
+    });
+    expect(plan.first).toEqual([]);
+    expect(plan.others.map((o) => o.callerId)).toEqual(['c']);
+  });
+
+  it('next step: wait while ringing, then everyone else, then the missed-call message', () => {
+    expect(INBOUND_FIRST_OFFER_SECONDS).toBe(15);
+    expect(INBOUND_TOTAL_RING_SECONDS).toBe(30);
+    expect(nextInboundStep({ elapsedMs: 3_000, othersOffered: false, ringingOffers: 1 })).toBe('wait');
+    expect(nextInboundStep({ elapsedMs: 15_000, othersOffered: false, ringingOffers: 0 })).toBe('offer_others');
+    // The last caller declined at once: the others get it straight away.
+    expect(nextInboundStep({ elapsedMs: 2_000, othersOffered: false, ringingOffers: 0 })).toBe('offer_others');
+    expect(nextInboundStep({ elapsedMs: 20_000, othersOffered: true, ringingOffers: 0 })).toBe('fallback');
+    expect(nextInboundStep({ elapsedMs: 27_000, othersOffered: false, ringingOffers: 0 })).toBe('fallback');
+    expect(othersRingSeconds(15_000)).toBe(15);
+    expect(othersRingSeconds(2_000)).toBe(28);
+    expect(othersRingSeconds(29_000)).toBe(5);
+  });
+
+  it('ring body: dials the caller app by SIP URI from our number, with the offer in header and client_state', () => {
+    const body = buildRingBody({ voiceAppId: 'app', sipUsername: 'gencredABC', from: '+12145550001', offerId: ID, parentId: P, ringSeconds: 15 });
+    expect(body).toMatchObject({
+      connection_id: 'app',
+      to: 'sip:gencredABC@sip.telnyx.com',
+      from: '+12145550001',
+      timeout_secs: 15,
+      custom_headers: [{ name: 'X-Quest-Offer', value: ID }],
+      command_id: `ring-${ID}`,
+    });
+    expect(decodeClientState(body.client_state)).toEqual({ v: 1, k: 'ring', id: ID, p: P });
+    // Never bridged automatically, never recorded on its own.
+    expect(body).not.toHaveProperty('link_to');
+    expect(body).not.toHaveProperty('record');
+  });
+
+  it('missed-call message: one constant, natural voice with a standard fallback', () => {
+    expect(MISSED_CALLBACK_SPEECH.text).toBe("Thanks for calling back. Sorry we missed you. We'll try you again shortly.");
+    const cs = encodeClientState({ v: 1, k: 'in', id: P, st: 'polite' });
+    expect(missedCallbackSpeakBody(cs)).toEqual({
+      payload: MISSED_CALLBACK_SPEECH.text,
+      payload_type: 'text',
+      voice: 'Azure.en-US-Ava:DragonHDLatestNeural',
+      language: 'en-US',
+      client_state: cs,
+    });
+    expect(missedCallbackSpeakBody(cs, true).voice).toBe('AWS.Polly.Joanna-Neural');
   });
 });

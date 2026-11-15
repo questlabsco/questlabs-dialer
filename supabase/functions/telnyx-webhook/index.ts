@@ -6,15 +6,14 @@
 //   supabase functions deploy telnyx-webhook --no-verify-jwt
 // Authentication is the Telnyx signature: Ed25519 over `${telnyx-timestamp}|${raw body}`.
 import {
+  AGENT_LEG_DESTINATION,
   agentSessionIdOf,
   base64ToBytes,
   encodeClientState,
   hangupToEndReason,
   isFreshTimestamp,
-  normalizeTelnyxNumber,
+  parentOfOfferTag,
   parseWebhook,
-  POLITE_MISSED_MESSAGE,
-  POLITE_VOICE,
   rawEd25519PublicKey,
   recordingRef,
   signedMessage,
@@ -26,12 +25,25 @@ import {
   callCommand,
   emitEvent,
   env,
-  liveAgentSession,
   loadConfig,
   loadSettings,
   telnyx,
   type TelephonyConfig,
 } from '../_shared/telnyx.ts';
+import {
+  bridgeInbound,
+  claimInbound,
+  closeOffersOnParentEnd,
+  endOffer,
+  isOfferRow,
+  isRingOffer,
+  loadCall,
+  onRingLegEnded,
+  speakMissed,
+  startInbound,
+  winnerOfferId,
+  type InboundRow,
+} from '../_shared/telnyxInbound.ts';
 
 // ---------------------------------------------------------------------------
 // Signature
@@ -106,29 +118,13 @@ Deno.serve(async (req) => {
 // Routing
 // ---------------------------------------------------------------------------
 
-interface CallRow {
-  id: string;
-  caller_id: string | null;
-  lead_id: string | null;
-  direction: 'outbound' | 'inbound';
-  from_number: string;
-  to_number: string;
-  status: string;
-  call_control_id: string | null;
-  call_leg_id: string | null;
-  agent_session_id: string | null;
-  record: boolean;
-  recording_id: string | null;
-  machine: boolean;
-  local_end_reason: EndReason | null;
-  created_at: string;
-  answered_at: string | null;
-}
+/** A telephony_calls row (outbound lead leg, inbound parent, or inbound offer). */
+type CallRow = InboundRow & { machine: boolean };
 
 async function findCall(w: ParsedWebhook): Promise<CallRow | null> {
   const db = adminClient();
   const cs = w.clientState;
-  if (cs && (cs.k === 'out' || cs.k === 'in')) {
+  if (cs && (cs.k === 'out' || cs.k === 'in' || cs.k === 'ring')) {
     const { data } = await db.from('telephony_calls').select('*').eq('id', cs.id).maybeSingle();
     if (data) return data as CallRow;
   }
@@ -144,15 +140,21 @@ async function findCall(w: ParsedWebhook): Promise<CallRow | null> {
 }
 
 async function dispatch(w: ParsedWebhook, cfg: TelephonyConfig | null): Promise<void> {
-  const isAgentLeg =
-    w.clientState?.k === 'agent' || (!!cfg?.credential_connection_id && w.connectionId === cfg.credential_connection_id);
+  const onCredentialConnection = !!cfg?.credential_connection_id && w.connectionId === cfg.credential_connection_id;
+  // A ring leg's far side as seen by the credential connection (if Telnyx reports it): not ours to control.
+  if (w.clientState?.k === 'ring' && onCredentialConnection) return;
+  const isAgentLeg = w.clientState?.k === 'agent' || onCredentialConnection;
   if (isAgentLeg) return handleAgentLeg(w);
 
   const row = await findCall(w);
-  if (row) return row.direction === 'outbound' ? handleOutbound(w, row) : handleInbound(w, row);
+  if (row) {
+    if (row.direction === 'outbound') return handleOutbound(w, row);
+    if (isOfferRow(row)) return handleRingLeg(w, row);
+    return handleInbound(w, row);
+  }
 
   if (w.kind === 'initiated' && w.direction === 'incoming' && cfg?.voice_app_id && w.connectionId === cfg.voice_app_id) {
-    return handleNewInbound(w);
+    return startInbound(w);
   }
   // Anything else (events for calls we do not know) is ignored.
 }
@@ -177,8 +179,11 @@ async function handleAgentLeg(w: ParsedWebhook): Promise<void> {
           .maybeSingle()
       : { data: null };
     if (!session || !ccid) {
-      // Not one of our app's sessions: do not leave a parked leg around.
-      if (ccid) await callCommand(ccid, 'hangup', {});
+      // Not one of our app's sessions: do not leave a parked leg around. Only the app's own
+      // outgoing agent-leg attempts are hung up; a call ringing INTO a caller's app (a callback
+      // offer, placed by the Voice API app) is left alone.
+      const isAgentAttempt = sid !== null || (w.to ?? '').toLowerCase().includes(AGENT_LEG_DESTINATION) || w.state === 'parked';
+      if (ccid && isAgentAttempt) await callCommand(ccid, 'hangup', {});
       return;
     }
     await db
@@ -269,9 +274,12 @@ async function endCall(w: ParsedWebhook, row: CallRow): Promise<void> {
     .neq('status', 'ended')
     .select('id');
   if (!data?.length) return; // already ended: exactly one `ended` per call
-  // Inbound calls only reached the app (an `incoming` event) when a live agent session was found.
-  const appKnowsCall = row.direction === 'outbound' || row.agent_session_id !== null;
-  if (row.caller_id && appKnowsCall) await emitEvent({ callerId: row.caller_id, callId: row.id, type: 'ended', reason });
+  if (row.direction === 'outbound') {
+    if (row.caller_id) await emitEvent({ callerId: row.caller_id, callId: row.id, type: 'ended', reason });
+  } else {
+    // The app knows inbound calls only by their offer ids: end the winner's (or every ringing) offer.
+    await closeOffersOnParentEnd(row, reason, answered);
+  }
 
   if (row.direction === 'inbound' && !answered) {
     // Nobody took it (declined, timed out, no session, or the lead gave up): log a missed inbound.
@@ -293,6 +301,7 @@ async function endCall(w: ParsedWebhook, row: CallRow): Promise<void> {
   }
 }
 
+
 async function attachRecording(w: ParsedWebhook, row: CallRow): Promise<void> {
   const db = adminClient();
   let recordingId = row.recording_id;
@@ -306,69 +315,20 @@ async function attachRecording(w: ParsedWebhook, row: CallRow): Promise<void> {
     console.error('call.recording.saved without a resolvable recording id for call', row.id);
     return;
   }
+  // An inbound call's CallRecord is created by the app with the winner's OFFER id as provider_call_id.
+  const offerId = row.direction === 'inbound' ? winnerOfferId(row) : null;
+  const ids = offerId ? [row.id, offerId] : [row.id];
   await db
     .from('telephony_calls')
     .update({ recording_id: recordingId, recording_saved_at: new Date().toISOString() })
-    .eq('id', row.id);
+    .in('id', ids);
   // If the app has already created the CallRecord, attach now; otherwise the calls trigger does it.
-  await db.from('calls').update({ recording_url: recordingRef(recordingId) }).eq('provider_call_id', row.id).is('recording_url', null);
+  await db.from('calls').update({ recording_url: recordingRef(recordingId) }).in('provider_call_id', ids).is('recording_url', null);
 }
 
 // ---------------------------------------------------------------------------
-// Inbound calls
+// Inbound calls: the PSTN leg (parent row). Routing lives in _shared/telnyxInbound.ts.
 // ---------------------------------------------------------------------------
-
-async function handleNewInbound(w: ParsedWebhook): Promise<void> {
-  const db = adminClient();
-  const from = normalizeTelnyxNumber(w.from) ?? w.from ?? 'unknown';
-  const to = normalizeTelnyxNumber(w.to) ?? w.to ?? 'unknown';
-  const id = crypto.randomUUID();
-
-  const { data: lead } = await db
-    .from('leads')
-    .select('id, last_called_by')
-    .contains('phones', [from])
-    .order('last_called_at', { ascending: false, nullsFirst: false })
-    .limit(1)
-    .maybeSingle();
-
-  let target: string | null = (lead?.last_called_by as string | null) ?? null;
-  if (target) {
-    const { data: prof } = await db.from('profiles').select('active').eq('id', target).maybeSingle();
-    if (!prof?.active) target = null;
-  }
-  const session = target ? await liveAgentSession(target) : null;
-
-  await db.from('telephony_calls').insert({
-    id,
-    caller_id: target,
-    lead_id: (lead?.id as string | undefined) ?? null,
-    direction: 'inbound',
-    from_number: from,
-    to_number: to,
-    ring: 1,
-    status: session ? 'incoming' : 'declining',
-    call_control_id: w.callControlId,
-    call_leg_id: w.callLegId,
-    call_session_id: w.callSessionId,
-    agent_session_id: session?.id ?? null,
-    local_end_reason: session ? null : 'no_answer',
-  });
-
-  if (session && target) {
-    // Ring the caller's app. The app answers / declines via telnyx-call, or declines politely after
-    // INBOUND_RING_SECONDS; the Voice API app's first-command timeout is the server-side backstop.
-    await emitEvent({ callerId: target, callId: id, type: 'incoming', from, to });
-    return;
-  }
-  // Nobody can take it: answer, apologise, hang up.
-  if (w.callControlId) {
-    await callCommand(w.callControlId, 'answer', {
-      client_state: encodeClientState({ v: 1, k: 'in', id, st: 'polite' }),
-      command_id: `polite-${id}`,
-    });
-  }
-}
 
 async function handleInbound(w: ParsedWebhook, row: CallRow): Promise<void> {
   const db = adminClient();
@@ -378,40 +338,29 @@ async function handleInbound(w: ParsedWebhook, row: CallRow): Promise<void> {
     case 'answered': {
       if (!ccid) return;
       if (st === 'polite' || row.status === 'declining') {
-        await callCommand(ccid, 'speak', {
-          payload: POLITE_MISSED_MESSAGE,
-          voice: POLITE_VOICE,
-          language: 'en-US',
-          client_state: encodeClientState({ v: 1, k: 'in', id: row.id, st: 'polite' }),
-        });
+        await speakMissed(ccid, row.id);
         return;
       }
       if (st === 'bridge' || row.status === 'answering') {
-        const agent = row.caller_id ? await liveAgentSession(row.caller_id) : null;
-        if (!agent) {
+        const parent = (await loadCall(row.id)) ?? row;
+        const result = await bridgeInbound(w, parent);
+        if (result === 'no_agent') {
+          // The winner's audio leg is gone: apologise instead of leaving the person in silence.
           await db.from('telephony_calls').update({ status: 'declining', local_end_reason: 'failed' }).eq('id', row.id);
-          await callCommand(ccid, 'speak', {
-            payload: POLITE_MISSED_MESSAGE,
-            voice: POLITE_VOICE,
-            language: 'en-US',
-            client_state: encodeClientState({ v: 1, k: 'in', id: row.id, st: 'polite' }),
-          });
+          await closeOffersOnParentEnd(parent, 'failed', false);
+          await speakMissed(ccid, row.id);
           return;
         }
-        // Bridge from the agent leg so that the AGENT leg is parked (not hung up) when the lead leaves.
-        await callCommand(
-          agent.call_control_id,
-          'bridge',
-          { call_control_id: ccid, park_after_unbridge: 'self', prevent_double_bridge: true, command_id: `bridge-${row.id}` },
-          false,
-        );
         const { data } = await db
           .from('telephony_calls')
           .update({ status: 'answered', answered_at: w.occurredAt ?? new Date().toISOString() })
           .eq('id', row.id)
           .eq('status', 'answering')
           .select('id');
-        if (data?.length && row.caller_id) await emitEvent({ callerId: row.caller_id, callId: row.id, type: 'answered' });
+        const offerId = winnerOfferId(parent);
+        if (data?.length && parent.caller_id && offerId) {
+          await emitEvent({ callerId: parent.caller_id, callId: offerId, type: 'answered' });
+        }
         const settings = await loadSettings();
         if (settings.record_calls) {
           await db.from('telephony_calls').update({ record: true }).eq('id', row.id);
@@ -437,3 +386,46 @@ async function handleInbound(w: ParsedWebhook, row: CallRow): Promise<void> {
       return;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Ring legs: the Voice API app ringing a signed-in caller's app with a callback (offer rows).
+// ---------------------------------------------------------------------------
+
+async function handleRingLeg(w: ParsedWebhook, row: CallRow): Promise<void> {
+  const db = adminClient();
+  const offer = (await loadCall(row.id)) ?? row;
+  const parentId = parentOfOfferTag(offer.call_session_id);
+  if (!parentId || !isRingOffer(offer)) return;
+  const ccid = w.callControlId ?? offer.call_control_id;
+  switch (w.kind) {
+    case 'initiated': {
+      if (!offer.call_control_id && ccid) {
+        await db.from('telephony_calls').update({ call_control_id: ccid, call_leg_id: w.callLegId }).eq('id', offer.id);
+      }
+      return;
+    }
+    case 'answered': {
+      // The caller pressed Answer in the app.
+      if (offer.status !== 'incoming' || !offer.caller_id || !ccid) {
+        await endOffer({ ...offer, call_control_id: ccid }, 'hangup_remote');
+        return;
+      }
+      await db
+        .from('agent_sessions')
+        .update({ status: 'live', call_control_id: ccid, live_at: new Date().toISOString() })
+        .eq('id', offer.agent_session_id!)
+        .neq('status', 'ended');
+      const won = await claimInbound({ ...offer, call_control_id: ccid }, offer.agent_session_id!);
+      if (!won) {
+        // Someone else answered first, or the missed-call message has started.
+        await endOffer({ ...offer, call_control_id: ccid }, 'hangup_remote');
+      }
+      return;
+    }
+    case 'hangup':
+      return onRingLegEnded(offer);
+    default:
+      return;
+  }
+}
+

@@ -69,6 +69,7 @@ export class SimulatedTelephony implements Telephony {
   private lastDialAt = new Map<string, number>();
   private seq = 0;
   private muted = false;
+  private standby = false;
   protected readonly random: () => number;
   private readonly fixedSpeed: number | null;
   private readonly now: () => number;
@@ -138,6 +139,20 @@ export class SimulatedTelephony implements Telephony {
   async connect(): Promise<void> {
     await new Promise<void>((resolve) => setTimeout(resolve, this.ms(0.3)));
     this._connected = true;
+  }
+
+  /** Standby is a no-op in demo mode (call-backs only follow simulated dials). */
+  async startStandby(): Promise<void> {
+    this.standby = true;
+  }
+
+  async stopStandby(): Promise<void> {
+    this.standby = false;
+  }
+
+  /** True between startStandby() and stopStandby(). */
+  get onStandby(): boolean {
+    return this.standby;
   }
 
   async disconnect(): Promise<void> {

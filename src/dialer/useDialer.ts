@@ -11,18 +11,32 @@ import type { DialerControls, DialerState } from './types';
 
 let engine: DialerEngine | null = null;
 
-/** The shared engine instance (created lazily). */
+/**
+ * The shared engine instance (created lazily, the first time a caller's screen needs it, i.e. right
+ * after a caller signs in). It puts the caller on standby so people calling back can reach them
+ * while they are not dialing.
+ */
 export function getDialerEngine(): DialerEngine {
-  if (!engine) engine = new DialerEngine({ api, telephony });
+  // While signing out, screens still rendering keep the engine being disposed (instead of starting
+  // a fresh one that would go back on standby for the user who is leaving).
+  if (!engine && disposing) return disposing;
+  if (!engine) engine = new DialerEngine({ api, telephony, standby: true });
   return engine;
 }
 
-/** Stops and discards the shared engine (call on sign-out). Hangs up and releases its locks. */
+let disposing: DialerEngine | null = null;
+
+/** Stops and discards the shared engine (call on sign-out): hangs up, releases locks, ends standby. */
 export async function resetDialerEngine(): Promise<void> {
   if (engine) {
     const e = engine;
     engine = null;
-    await e.dispose();
+    disposing = e;
+    try {
+      await e.dispose();
+    } finally {
+      if (disposing === e) disposing = null;
+    }
   }
 }
 

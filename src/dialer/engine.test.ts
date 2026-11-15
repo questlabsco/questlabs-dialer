@@ -6,6 +6,7 @@ import { SimulatedTelephony } from '../telephony/simulated';
 import {
   DialerEngine,
   MANUAL_DURING_CALL_MESSAGE,
+  MANUAL_DURING_INCOMING_MESSAGE,
   MANUAL_INVALID_NUMBER_MESSAGE,
   MANUAL_WHILE_DIALING_MESSAGE,
   NO_CAPACITY_MESSAGE,
@@ -27,6 +28,10 @@ class FakeTelephony implements Telephony {
   answeredIncoming: string[] = [];
   muted = false;
   digits: string[] = [];
+  standbyStarts = 0;
+  standbyStops = 0;
+  failAnswer: Error | null = null;
+  logsMissedInbound = false;
   private live = new Set<string>();
   private seq = 0;
   private listeners = new Set<TelephonyListener>();
@@ -74,7 +79,14 @@ class FakeTelephony implements Telephony {
   async setMuted(muted: boolean): Promise<void> {
     this.muted = muted;
   }
+  async startStandby(): Promise<void> {
+    this.standbyStarts++;
+  }
+  async stopStandby(): Promise<void> {
+    this.standbyStops++;
+  }
   async answerIncoming(callId: string): Promise<void> {
+    if (this.failAnswer) throw this.failAnswer;
     this.answeredIncoming.push(callId);
     this.emit({ type: 'answered', callId });
   }
@@ -98,7 +110,7 @@ function leadRows(n: number, opts: { prefix?: string; ext?: number; phones?: num
   }));
 }
 
-async function setup(opts: { leads?: NewLead[]; settings?: Partial<Settings>; noNumbers?: boolean } = {}) {
+async function setup(opts: { leads?: NewLead[]; settings?: Partial<Settings>; noNumbers?: boolean; standby?: boolean } = {}) {
   const api = new DemoApi({ storage: null, now: () => Date.now(), simulatePresence: false, empty: true });
   await api.signInDemo('admin');
   if (opts.settings) await api.saveSettings(opts.settings);
@@ -106,7 +118,7 @@ async function setup(opts: { leads?: NewLead[]; settings?: Partial<Settings>; no
   if (opts.noNumbers) for (const n of await api.listNumbers()) await api.updateNumber(n.id, { active: false });
   const me = await api.signInDemo('caller');
   const tel = new FakeTelephony();
-  const engine = new DialerEngine({ api, telephony: tel });
+  const engine = new DialerEngine({ api, telephony: tel, standby: opts.standby });
   const settle = () => engine.settled();
   const lead = (businessName: string): Lead => api.debugState().leads.find((l) => l.businessName === businessName)!;
   const leadById = (id: string): Lead => api.debugState().leads.find((l) => l.id === id)!;
@@ -981,4 +993,204 @@ describe('dialer engine: manual calls', () => {
     expect(phases.has('connected')).toBe(true);
     expect(phases.has('wrap_up')).toBe(false);
   }, 30_000);
+});
+
+describe('dialer engine: callbacks while not dialing (standby)', () => {
+  it('goes on standby when created for a signed-in caller and off it on dispose', async () => {
+    const t = await setup({ standby: true });
+    const presence = vi.spyOn(t.api, 'setPresence');
+    await t.settle();
+    expect(t.tel.standbyStarts).toBe(1);
+    expect(t.tel.connected).toBe(false);
+    await t.engine.dispose();
+    expect(t.tel.standbyStops).toBe(1);
+    expect(presence).toHaveBeenCalledWith('idle', null);
+  });
+
+  it('without standby nothing is started (tests, demo fixtures)', async () => {
+    const t = await setup();
+    await t.settle();
+    await t.engine.dispose();
+    expect(t.tel.standbyStarts).toBe(0);
+    expect(t.tel.standbyStops).toBe(0);
+  });
+
+  it('idle: a known lead calling back rings, is answered, wrap-up, then back to idle', async () => {
+    const t = await setup({ leads: leadRows(2), standby: true });
+    await t.settle();
+    const lead = t.lead('Biz 1');
+    const inId = t.tel.incoming(lead.phones[0]);
+    await t.settle();
+    let s = t.engine.getState();
+    expect(s.phase).toBe('idle');
+    expect(s.incoming).toMatchObject({ callId: inId, from: lead.phones[0] });
+    expect(s.incoming!.lead!.id).toBe(lead.id);
+
+    await t.engine.answerIncoming();
+    await t.settle();
+    s = t.engine.getState();
+    expect(s.phase).toBe('connected');
+    expect(s.activeCall).toMatchObject({ callId: inId, direction: 'inbound' });
+    expect(s.activeCall!.lead.id).toBe(lead.id);
+    expect(s.lines).toHaveLength(1);
+    expect(s.incoming).toBeNull();
+    // No dialing session was opened and nothing was dialed.
+    expect(t.tel.connected).toBe(false);
+    expect(t.tel.dials).toHaveLength(0);
+    expect(t.callFor(inId)).toMatchObject({ direction: 'inbound', result: 'answered', leadId: lead.id });
+
+    await vi.advanceTimersByTimeAsync(40_000);
+    await t.emit({ type: 'ended', callId: inId, reason: 'hangup_remote' });
+    expect(t.engine.getState().phase).toBe('wrap_up');
+    await t.engine.submitDisposition({ disposition: 'callback', notes: 'Call Tuesday', callbackAt: new Date(NOW + 86_400_000).toISOString() });
+    await t.settle();
+    s = t.engine.getState();
+    expect(s.phase).toBe('idle');
+    expect(s.lines).toEqual([]);
+    expect(t.lead('Biz 1').status).toBe('callback');
+    expect(t.tel.dials).toHaveLength(0);
+    expect(t.callFor(inId).talkSeconds).toBe(40);
+  });
+
+  it('idle: an unknown number is answered with no wrap-up and returns to idle', async () => {
+    const t = await setup({ leads: leadRows(1), standby: true });
+    await t.settle();
+    const inId = t.tel.incoming('+19725550123');
+    await t.settle();
+    expect(t.engine.getState().incoming!.lead).toBeNull();
+    await t.engine.answerIncoming();
+    await t.settle();
+    expect(t.engine.getState().activeCall!.lead).toMatchObject({ id: 'unknown:+19725550123', businessName: 'Unknown caller' });
+    await t.engine.hangUp();
+    await t.settle();
+    const s = t.engine.getState();
+    expect(s.phase).toBe('idle');
+    expect(s.wrapUp).toBeNull();
+    expect(t.tel.hangups).toContain(inId);
+    expect(t.callFor(inId)).toMatchObject({ leadId: null, direction: 'inbound', result: 'answered' });
+  });
+
+  it('idle: declining stays idle and logs a missed inbound (when the provider does not)', async () => {
+    const t = await setup({ standby: true });
+    await t.settle();
+    const inId = t.tel.incoming('+19725550124');
+    await t.settle();
+    await t.engine.declineIncoming();
+    await t.settle();
+    expect(t.tel.declined).toContain(inId);
+    expect(t.engine.getState()).toMatchObject({ phase: 'idle', incoming: null });
+    expect(t.callFor(inId)).toMatchObject({ direction: 'inbound', result: 'missed_inbound', leadId: null });
+  });
+
+  it('a provider that logs missed calls itself gets no duplicate row from the engine', async () => {
+    const t = await setup({ standby: true });
+    t.tel.logsMissedInbound = true;
+    await t.settle();
+    const in1 = t.tel.incoming('+19725550125');
+    await t.settle();
+    await t.engine.declineIncoming();
+    const in2 = t.tel.incoming('+19725550126');
+    await t.settle();
+    await t.emit({ type: 'ended', callId: in2, reason: 'hangup_remote' });
+    expect(t.callFor(in1)).toBeUndefined();
+    expect(t.callFor(in2)).toBeUndefined();
+  });
+
+  it('idle: the person giving up clears the banner and stays idle', async () => {
+    const t = await setup({ standby: true });
+    await t.settle();
+    const inId = t.tel.incoming('+19725550127');
+    await t.settle();
+    await t.emit({ type: 'ended', callId: inId, reason: 'hangup_remote' });
+    expect(t.engine.getState()).toMatchObject({ phase: 'idle', incoming: null });
+  });
+
+  it('idle: answering fails (e.g. microphone blocked): rejects with the reason, declines, stays idle', async () => {
+    const t = await setup({ standby: true });
+    await t.settle();
+    const inId = t.tel.incoming('+19725550128');
+    await t.settle();
+    t.tel.failAnswer = new Error('Microphone access was denied.');
+    await expect(t.engine.answerIncoming()).rejects.toThrow(/Couldn't answer: Microphone access was denied/);
+    await t.settle();
+    expect(t.tel.declined).toContain(inId);
+    expect(t.engine.getState()).toMatchObject({ phase: 'idle', incoming: null, activeCall: null });
+    // A later Start works normally.
+    t.tel.failAnswer = null;
+  });
+
+  it('idle: Start and Call a number wait until the incoming call is answered or declined', async () => {
+    const t = await setup({ leads: leadRows(1), standby: true });
+    await t.settle();
+    t.tel.incoming('+19725550129');
+    await t.settle();
+    await expect(t.engine.start()).rejects.toThrow(MANUAL_DURING_INCOMING_MESSAGE);
+    await expect(t.engine.callNumber('(972) 555-0100')).rejects.toThrow(MANUAL_DURING_INCOMING_MESSAGE);
+    expect(t.engine.getState().phase).toBe('idle');
+    await t.engine.declineIncoming();
+    await t.engine.start();
+    await t.settle();
+    expect(t.engine.getState().phase).toBe('dialing');
+  });
+
+  it('idle: a telephony error (standby reconnecting) does not put the dialer in error', async () => {
+    const t = await setup({ standby: true });
+    await t.settle();
+    await t.emit({ type: 'error', message: 'Live call updates are reconnecting...' });
+    expect(t.engine.getState()).toMatchObject({ phase: 'idle', error: null });
+  });
+
+  it('paused: declining keeps the dialer paused', async () => {
+    const t = await setup({ leads: leadRows(1), standby: true });
+    await t.engine.start();
+    await t.settle();
+    await t.engine.pause();
+    const inId = t.tel.incoming('+19725550130');
+    await t.settle();
+    expect(t.engine.getState().incoming!.callId).toBe(inId);
+    await t.engine.declineIncoming();
+    await t.settle();
+    expect(t.engine.getState()).toMatchObject({ phase: 'paused', incoming: null, pauseRequested: false });
+  });
+
+  it('paused: an answered callback to a known lead wraps up and returns to paused', async () => {
+    const t = await setup({ leads: leadRows(2), standby: true });
+    await t.engine.start();
+    await t.settle();
+    await t.engine.pause();
+    const lead = t.lead('Biz 1');
+    const inId = t.tel.incoming(lead.phones[0]);
+    await t.settle();
+    await t.engine.answerIncoming();
+    await t.settle();
+    expect(t.engine.getState().phase).toBe('connected');
+    await t.emit({ type: 'ended', callId: inId, reason: 'hangup_remote' });
+    expect(t.engine.getState().phase).toBe('wrap_up');
+    await t.engine.submitDisposition({ disposition: 'not_interested', notes: '' });
+    await t.settle();
+    expect(t.engine.getState().phase).toBe('paused');
+  });
+
+  it('wrap-up: a callback is declined (offered to someone else) and the wrap-up stays', async () => {
+    const t = await setup({ leads: leadRows(2), standby: true });
+    await t.engine.start();
+    await t.settle();
+    await t.emit({ type: 'answered', callId: t.tel.dials[0].callId });
+    await t.engine.hangUp();
+    expect(t.engine.getState().phase).toBe('wrap_up');
+    const inId = t.tel.incoming('+19725550131');
+    await t.settle();
+    expect(t.tel.declined).toContain(inId);
+    expect(t.engine.getState()).toMatchObject({ phase: 'wrap_up', incoming: null });
+  });
+
+  it('dispose while a callback rings declines it', async () => {
+    const t = await setup({ standby: true });
+    await t.settle();
+    const inId = t.tel.incoming('+19725550132');
+    await t.settle();
+    await t.engine.dispose();
+    expect(t.tel.declined).toContain(inId);
+    expect(t.tel.standbyStops).toBe(1);
+  });
 });

@@ -3,7 +3,7 @@ import { decodeClientState, type TelephonyEventRow } from '../../supabase/functi
 import type { TelephonyEvent } from './Telephony';
 import { TelnyxTelephony } from './telnyx';
 import type { SubscriptionStatus, TelnyxBackend } from './telnyxBackend';
-import type { RtcAgentCall, RtcCallbacks, RtcFactory, StartAgentLegOptions } from './telnyxRtc';
+import type { RtcAgentCall, RtcCallbacks, RtcFactory, RtcInboundCall, StartAgentLegOptions } from './telnyxRtc';
 
 class FakeBackend implements TelnyxBackend {
   calls: { fn: string; body: Record<string, unknown> }[] = [];
@@ -49,8 +49,56 @@ class FakeBackend implements TelnyxBackend {
   }
 }
 
+interface FakeInbound extends RtcInboundCall {
+  answered: boolean | null;
+  hungUp: boolean;
+  mutes: boolean[];
+  digits: string[];
+  end(): void;
+}
+
 class FakeRtc {
   token: string | null = null;
+  connects = 0;
+  disconnects = 0;
+  inbound: FakeInbound[] = [];
+  /** The server rings this client (a callback offer). */
+  ring(offerId: string | null): FakeInbound {
+    let ended = false;
+    const cbs: (() => void)[] = [];
+    const c: FakeInbound = {
+      id: `sdk-${this.inbound.length + 1}`,
+      offerId,
+      answered: null,
+      hungUp: false,
+      mutes: [],
+      digits: [],
+      get ended() {
+        return ended;
+      },
+      answer: async (muted) => {
+        c.answered = muted;
+      },
+      setMuted: (m) => c.mutes.push(m),
+      dtmf: (d) => c.digits.push(d),
+      hangup: async () => {
+        c.hungUp = true;
+        c.end();
+      },
+      onEnded: (cb) => {
+        if (ended) cb();
+        else cbs.push(cb);
+      },
+      end: () => {
+        if (ended) return;
+        ended = true;
+        for (const cb of cbs.splice(0)) cb();
+      },
+    };
+    this.inbound.push(c);
+    this.callbacks!.onIncomingCall!(c);
+    return c;
+  }
   legs: { opts: StartAgentLegOptions; muted: boolean[]; digits: string[]; hungUp: boolean; resolve: () => void }[] = [];
   callbacks: RtcCallbacks | null = null;
   activateImmediately = true;
@@ -59,6 +107,7 @@ class FakeRtc {
     return {
       connect: async (token) => {
         this.token = token;
+        this.connects++;
       },
       startAgentLeg: (opts) => {
         let resolve!: () => void;
@@ -76,7 +125,9 @@ class FakeRtc {
         };
         return call;
       },
-      disconnect: async () => {},
+      disconnect: async () => {
+        this.disconnects++;
+      },
     };
   };
 }
@@ -97,6 +148,7 @@ function row(p: Partial<TelephonyEventRow> & Pick<TelephonyEventRow, 'type'>): T
 }
 
 async function setup(opts: { micDenied?: boolean; activate?: boolean } = {}) {
+  let micRequests = 0;
   const backend = new FakeBackend();
   backend.latest = seq;
   const rtc = new FakeRtc();
@@ -107,11 +159,12 @@ async function setup(opts: { micDenied?: boolean; activate?: boolean } = {}) {
     backend,
     rtc: rtc.factory,
     requestMicrophone: async () => {
+      micRequests++;
       if (opts.micDenied) throw new Error('Microphone access was denied.');
     },
   });
   t.on((e) => events.push(e));
-  return { t, backend, rtc, events };
+  return { t, backend, rtc, events, micRequests: () => micRequests };
 }
 
 beforeEach(() => {
@@ -301,6 +354,9 @@ describe('TelnyxTelephony calls', () => {
 
     backend.onRow!(row({ type: 'incoming', call_id: 'in-2', from_number: '+12145550008', to_number: '+12145550001' }));
     await vi.advanceTimersByTimeAsync(20_100);
+    // The server moves an unanswered call on itself; the app's own timeout is only a late backstop.
+    expect(backend.fnCalls('telnyx-call', 'timeout')).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(15_100);
     expect(backend.fnCalls('telnyx-call', 'timeout')[0].body).toEqual({ action: 'timeout', callId: 'in-2' });
   });
 
@@ -345,5 +401,159 @@ describe('TelnyxTelephony calls', () => {
     expect(rtc.legs[0].hungUp).toBe(true);
     expect(events).toEqual([{ type: 'ended', callId: id, reason: 'hangup_local' }]);
     expect(t.connected).toBe(false);
+  });
+});
+
+const OFFER = '0b6c1f2e-3d4a-4b5c-8d6e-7f8091a2b3c4';
+const deviceRow = (callId = OFFER) =>
+  row({ type: 'incoming', call_id: callId, from_number: '+12145550009', to_number: '+12145550001', message: 'device' });
+
+describe('TelnyxTelephony standby (signed in, not dialing)', () => {
+  it('logs in and listens without a microphone or an open call leg', async () => {
+    const { t, backend, rtc, micRequests } = await setup();
+    await t.startStandby();
+    expect(t.connected).toBe(false);
+    expect(rtc.token).toBe('jwt-token');
+    expect(rtc.legs).toHaveLength(0);
+    expect(backend.subscribeCount).toBe(1);
+    expect(backend.fnCalls('telnyx-agent')).toHaveLength(0);
+    expect(micRequests()).toBe(0);
+    expect(t.logsMissedInbound).toBe(true);
+  });
+
+  it('answers a callback that rings this device: microphone, SDK answer, no server answer', async () => {
+    const { t, backend, rtc, events, micRequests } = await setup();
+    await t.startStandby();
+    const sdk = rtc.ring(OFFER);
+    backend.onRow!(deviceRow());
+    expect(events).toEqual([{ type: 'incoming', callId: OFFER, from: '+12145550009', to: '+12145550001' }]);
+    await t.answerIncoming(OFFER);
+    expect(micRequests()).toBe(1);
+    expect(sdk.answered).toBe(false);
+    expect(backend.fnCalls('telnyx-call', 'answer')).toHaveLength(0);
+    backend.onRow!(row({ type: 'answered', call_id: OFFER }));
+    expect(events.at(-1)).toEqual({ type: 'answered', callId: OFFER });
+
+    await t.setMuted(true);
+    expect(sdk.mutes).toEqual([true]);
+    await t.sendDigits(OFFER, '5');
+    expect(sdk.digits).toEqual(['5']);
+
+    await t.hangup(OFFER);
+    expect(sdk.hungUp).toBe(true);
+    expect(backend.fnCalls('telnyx-call', 'hangup')[0].body).toEqual({ action: 'hangup', callId: OFFER });
+    backend.onRow!(row({ type: 'ended', call_id: OFFER, reason: 'hangup_local' }));
+    expect(events.at(-1)).toEqual({ type: 'ended', callId: OFFER, reason: 'hangup_local' });
+  });
+
+  it('waits for the device call when the event arrives first', async () => {
+    const { t, backend, rtc } = await setup();
+    await t.startStandby();
+    backend.onRow!(deviceRow());
+    const p = t.answerIncoming(OFFER);
+    await vi.advanceTimersByTimeAsync(500);
+    const sdk = rtc.ring(OFFER);
+    await vi.advanceTimersByTimeAsync(200);
+    await p;
+    expect(sdk.answered).toBe(false);
+  });
+
+  it('matches a device call without our header when it is the only one ringing', async () => {
+    const { t, backend, rtc } = await setup();
+    await t.startStandby();
+    const sdk = rtc.ring(null);
+    backend.onRow!(deviceRow());
+    await t.answerIncoming(OFFER);
+    expect(sdk.answered).toBe(false);
+  });
+
+  it('rejects when the microphone is blocked, without answering', async () => {
+    const { t, backend, rtc } = await setup({ micDenied: true });
+    await t.startStandby();
+    const sdk = rtc.ring(OFFER);
+    backend.onRow!(deviceRow());
+    await expect(t.answerIncoming(OFFER)).rejects.toThrow(/Microphone access was denied/);
+    expect(sdk.answered).toBeNull();
+  });
+
+  it('rejects when the device call never shows up', async () => {
+    const { t, backend } = await setup();
+    await t.startStandby();
+    backend.onRow!(deviceRow());
+    const p = t.answerIncoming(OFFER);
+    const assertion = expect(p).rejects.toThrow(/could not be connected/);
+    await vi.advanceTimersByTimeAsync(8_200);
+    await assertion;
+  });
+
+  it('decline rejects the device call and tells the server', async () => {
+    const { t, backend, rtc } = await setup();
+    await t.startStandby();
+    const sdk = rtc.ring(OFFER);
+    backend.onRow!(deviceRow());
+    await t.declineIncoming(OFFER);
+    expect(sdk.hungUp).toBe(true);
+    expect(backend.fnCalls('telnyx-call', 'decline')[0].body).toEqual({ action: 'decline', callId: OFFER });
+  });
+
+  it('a callback answered elsewhere stops ringing here', async () => {
+    const { t, backend, rtc, events } = await setup();
+    await t.startStandby();
+    const sdk = rtc.ring(OFFER);
+    backend.onRow!(deviceRow());
+    backend.onRow!(row({ type: 'ended', call_id: OFFER, reason: 'hangup_remote' }));
+    expect(events.at(-1)).toEqual({ type: 'ended', callId: OFFER, reason: 'hangup_remote' });
+    expect(sdk.hungUp).toBe(true);
+  });
+
+  it('a dialing session reuses the standby login; ending it keeps standby until stopStandby', async () => {
+    const { t, rtc, backend } = await setup();
+    await t.startStandby();
+    await t.connect();
+    expect(rtc.connects).toBe(1);
+    expect(rtc.legs).toHaveLength(1);
+    const p = t.disconnect();
+    await vi.advanceTimersByTimeAsync(3_200);
+    await p;
+    expect(t.connected).toBe(false);
+    expect(rtc.legs[0].hungUp).toBe(true);
+    expect(rtc.disconnects).toBe(0);
+    expect(backend.fnCalls('telnyx-agent', 'stop')).toHaveLength(1);
+    await t.stopStandby();
+    expect(rtc.disconnects).toBe(1);
+  });
+
+  it('without standby, disconnect logs out as before', async () => {
+    const { t, rtc } = await setup();
+    await t.connect();
+    const p = t.disconnect();
+    await vi.advanceTimersByTimeAsync(3_200);
+    await p;
+    expect(rtc.disconnects).toBe(1);
+  });
+
+  it('a callback offered while dialing is answered through the server (bridged to the open line)', async () => {
+    const { t, backend } = await setup();
+    await t.startStandby();
+    await t.connect();
+    backend.onRow!(row({ type: 'incoming', call_id: OFFER, from_number: '+12145550009', to_number: '+12145550001' }));
+    await t.answerIncoming(OFFER);
+    expect(backend.fnCalls('telnyx-call', 'answer')[0].body).toEqual({ action: 'answer', callId: OFFER });
+  });
+
+  it('retries the standby login in the background when it fails', async () => {
+    const { t, backend, rtc } = await setup();
+    backend.failNext = null;
+    const orig = backend.userId.bind(backend);
+    let fail = true;
+    backend.userId = async () => {
+      if (fail) throw new Error('offline');
+      return orig();
+    };
+    await t.startStandby();
+    expect(rtc.token).toBeNull();
+    fail = false;
+    await vi.advanceTimersByTimeAsync(5_100);
+    expect(rtc.token).toBe('jwt-token');
   });
 });

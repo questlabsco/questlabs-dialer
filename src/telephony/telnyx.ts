@@ -9,17 +9,26 @@
  * - Events: telnyx-webhook writes telephony_events rows; we receive them over Supabase Realtime
  *   (filtered to our caller id), de-duplicate them, and emit TelephonyEvents. Missed rows are
  *   back-filled after every (re)subscription.
- * - Inbound: `incoming` events ring here; answer / decline go through telnyx-call. If nothing
- *   happens within INBOUND_RING_SECONDS we decline politely ('timeout').
+ * - Inbound (callbacks): `incoming` events ring here. Two kinds, chosen by the server:
+ *     - while dialing / paused (agent leg open): answer / decline go through telnyx-call, which
+ *       bridges the person to the agent leg;
+ *     - on standby (signed in, no open leg; startStandby keeps the WebRTC client logged in and
+ *       registered and the event subscription open): the server rings this client itself
+ *       (event message INCOMING_ON_DEVICE); answering asks for the microphone and answers that
+ *       SDK call; the server then bridges it to the person.
+ *   If nothing happens within INBOUND_RING_SECONDS we decline ('timeout'); the server normally
+ *   moves the call on well before that.
+ * - Missed inbound calls are logged by the server (logsMissedInbound).
  */
 import {
   encodeClientState,
   INBOUND_RING_SECONDS,
+  INCOMING_ON_DEVICE,
   type TelephonyEventRow,
 } from '../../supabase/functions/_shared/telnyxLogic';
 import type { DialRequest, EndReason, Telephony, TelephonyEvent, TelephonyListener } from './Telephony';
 import type { SubscriptionStatus, TelnyxBackend } from './telnyxBackend';
-import type { RtcAgentCall, RtcClient, RtcFactory } from './telnyxRtc';
+import type { RtcAgentCall, RtcClient, RtcFactory, RtcInboundCall } from './telnyxRtc';
 
 export interface TelnyxTelephonyOptions {
   /** Returns a fresh login token (Api.getTelephonyToken). */
@@ -41,9 +50,17 @@ interface KnownCall {
   ended: boolean;
   /** Timers owned by this call (watchdog / inbound auto-decline / fallbacks). */
   timers: unknown[];
+  /** Inbound call that rings this device (answered with the SDK, not via telnyx-call). */
+  device?: boolean;
+  /** The SDK call carrying the audio of a device call once answered. */
+  sdk?: RtcInboundCall;
 }
 
 const AGENT_LEG_TIMEOUT_MS = 20_000;
+/** How long answerIncoming waits for the device call's INVITE when the event came first. */
+const DEVICE_CALL_WAIT_MS = 8_000;
+/** Standby login retries (then every last value). */
+const STANDBY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000];
 const AGENT_RECOVERY_DELAYS_MS = [1_000, 3_000, 6_000];
 const RESUBSCRIBE_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 20_000];
 const PENDING_EVENT_TTL_MS = 60_000;
@@ -81,6 +98,7 @@ async function defaultRequestMicrophone(): Promise<void> {
 
 export class TelnyxTelephony implements Telephony {
   readonly kind = 'telnyx' as const;
+  readonly logsMissedInbound = true;
 
   private _connected = false;
   private connecting: Promise<void> | null = null;
@@ -92,6 +110,16 @@ export class TelnyxTelephony implements Telephony {
   private agentCall: RtcAgentCall | null = null;
   private agentSessionId: string | null = null;
   private recoveringAgent = false;
+
+  /** startStandby() was called and stopStandby() not yet. */
+  private standbyWanted = false;
+  /** The WebRTC client is logged in and the event subscription is open (standby or connected). */
+  private baseReady = false;
+  private baseStarting: Promise<void> | null = null;
+  private standbyRetry = 0;
+  private standbyTimer: unknown = null;
+  /** SDK calls ringing this client, by offer id (or SDK id when they carry none). */
+  private deviceCalls = new Map<string, RtcInboundCall>();
 
   private callerId: string | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -159,6 +187,69 @@ export class TelnyxTelephony implements Telephony {
   }
 
   // -------------------------------------------------------------------------
+  // Standby (signed in, reachable for callbacks, no open call leg)
+  // -------------------------------------------------------------------------
+
+  async startStandby(): Promise<void> {
+    this.standbyWanted = true;
+    if (this.baseReady && !this._connected && !this.connecting) {
+      // Still logged in for someone else (signed out and in again without a teardown): start over.
+      const backend = await this.getBackend();
+      const me = await backend.userId().catch(() => null);
+      if (me === this.callerId) return;
+      await this.teardownBase();
+    }
+    if (this.baseReady) return;
+    if (!this._connected && !this.connecting) this.disconnecting = false;
+    try {
+      await this.ensureBase();
+      this.standbyRetry = 0;
+    } catch (e) {
+      console.warn('[telnyx] standby login failed:', e instanceof Error ? e.message : String(e));
+      if (!this._connected && !this.connecting) await this.teardownBase();
+      this.scheduleStandbyRetry();
+    }
+  }
+
+  async stopStandby(): Promise<void> {
+    this.standbyWanted = false;
+    if (this.standbyTimer) this.clearT(this.standbyTimer);
+    this.standbyTimer = null;
+    if (this._connected || this.connecting) return; // disconnect() tears the rest down
+    for (const c of this.deviceCalls.values()) await c.hangup().catch(() => {});
+    await this.teardownBase();
+  }
+
+  private scheduleStandbyRetry(): void {
+    if (!this.standbyWanted || this.standbyTimer) return;
+    const delay = STANDBY_RETRY_DELAYS_MS[Math.min(this.standbyRetry, STANDBY_RETRY_DELAYS_MS.length - 1)];
+    this.standbyRetry++;
+    this.standbyTimer = this.setT(() => {
+      this.standbyTimer = null;
+      if (this.standbyWanted && !this.baseReady) void this.startStandby();
+    }, delay);
+  }
+
+  /** Logs the WebRTC client in and opens the event subscription (once; shared by standby and sessions). */
+  private ensureBase(): Promise<void> {
+    if (this.baseReady) return Promise.resolve();
+    if (!this.baseStarting) {
+      this.baseStarting = (async () => {
+        const backend = await this.getBackend();
+        this.callerId = await backend.userId();
+        this.lastEventId = await backend.latestEventId(this.callerId);
+        this.baselineEventId = this.lastEventId;
+        this.subscribeEvents();
+        await this.startRtc();
+        this.baseReady = true;
+      })().finally(() => {
+        this.baseStarting = null;
+      });
+    }
+    return this.baseStarting;
+  }
+
+  // -------------------------------------------------------------------------
   // connect / disconnect
   // -------------------------------------------------------------------------
 
@@ -175,13 +266,8 @@ export class TelnyxTelephony implements Telephony {
   private async doConnect(): Promise<void> {
     this.disconnecting = false;
     await (this.options.requestMicrophone ?? defaultRequestMicrophone)();
-    const backend = await this.getBackend();
     try {
-      this.callerId = await backend.userId();
-      this.lastEventId = await backend.latestEventId(this.callerId);
-      this.baselineEventId = this.lastEventId;
-      this.subscribeEvents();
-      await this.startRtc();
+      await this.ensureBase();
       await this.startAgentLeg();
       this._connected = true;
     } catch (e) {
@@ -194,6 +280,7 @@ export class TelnyxTelephony implements Telephony {
     const factory = await this.getRtcFactory();
     const rtc = factory({
       onFatal: (message, kind) => void this.onRtcFatal(message, kind),
+      onIncomingCall: (call) => this.onDeviceCall(call),
     });
     this.rtc = rtc;
     const token = await this.options.getToken();
@@ -261,6 +348,7 @@ export class TelnyxTelephony implements Telephony {
     await this.teardown();
   }
 
+  /** Closes the session (agent leg, calls); keeps the standby login when standby is wanted. */
   private async teardown(): Promise<void> {
     this.disconnecting = true;
     this._connected = false;
@@ -271,6 +359,19 @@ export class TelnyxTelephony implements Telephony {
     this.agentCall = null;
     if (call) await call.hangup().catch(() => {});
     if (backend && sessionId) await backend.invoke('telnyx-agent', { action: 'stop', sessionId }).catch(() => {});
+    for (const c of this.calls.values()) for (const t of c.timers) this.clearT(t);
+    this.calls.clear();
+    this.pending.clear();
+    this.emitted.clear();
+    if (this.standbyWanted && this.baseReady && this.rtc) {
+      this.disconnecting = false;
+      return;
+    }
+    await this.teardownBase();
+  }
+
+  private async teardownBase(): Promise<void> {
+    this.baseReady = false;
     const rtc = this.rtc;
     this.rtc = null;
     if (rtc) await rtc.disconnect().catch(() => {});
@@ -282,6 +383,7 @@ export class TelnyxTelephony implements Telephony {
     this.pending.clear();
     this.emitted.clear();
     this.seenEventIds.clear();
+    this.deviceCalls.clear();
   }
 
   private waitUntil(pred: () => boolean, ms: number): Promise<void> {
@@ -322,7 +424,23 @@ export class TelnyxTelephony implements Telephony {
   }
 
   private async onRtcFatal(message: string, kind: 'auth' | 'network' | 'other'): Promise<void> {
-    if (this.disconnecting || !this._connected) return;
+    if (this.disconnecting) return;
+    if (!this._connected) {
+      // Standby only: log in again in the background.
+      if (!this.standbyWanted || !this.baseReady) return;
+      const old = this.rtc;
+      this.rtc = null;
+      this.baseReady = false;
+      if (old) await old.disconnect().catch(() => {});
+      try {
+        await this.startRtc();
+        this.baseReady = true;
+      } catch {
+        this.rtc = null;
+        this.scheduleStandbyRetry();
+      }
+      return;
+    }
     // Re-login once with a fresh token, then reopen the agent leg.
     try {
       const old = this.rtc;
@@ -338,6 +456,44 @@ export class TelnyxTelephony implements Telephony {
           ? 'The phone service rejected your login. Press Start to sign in again.'
           : `Lost the connection to the phone service (${message}). Press Start to reconnect.`,
       );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Calls ringing this device
+  // -------------------------------------------------------------------------
+
+  private onDeviceCall(call: RtcInboundCall): void {
+    const key = call.offerId ?? `sdk:${call.id}`;
+    this.deviceCalls.set(key, call);
+    call.onEnded(() => {
+      if (this.deviceCalls.get(key) === call) this.deviceCalls.delete(key);
+      // The audio of an answered device call is gone; the server's `ended` normally follows at once.
+      for (const [id, known] of this.calls) {
+        if (known.sdk === call && !known.ended) {
+          known.timers.push(this.setT(() => this.emitEnded(id, 'hangup_remote'), LOCAL_END_FALLBACK_MS));
+        }
+      }
+    });
+  }
+
+  /** The SDK call for offer `callId`: by its header, else the only unmatched ringing call. */
+  private findDeviceCall(callId: string): RtcInboundCall | null {
+    const byId = this.deviceCalls.get(callId);
+    if (byId && !byId.ended) return byId;
+    const loose = [...this.deviceCalls.entries()].filter(([k, c]) => k.startsWith('sdk:') && !c.ended);
+    return loose.length === 1 ? loose[0][1] : null;
+  }
+
+  private async waitForDeviceCall(callId: string, ms: number): Promise<RtcInboundCall | null> {
+    let waited = 0;
+    for (;;) {
+      const c = this.findDeviceCall(callId);
+      if (c) return c;
+      const call = this.calls.get(callId);
+      if (!call || call.ended || waited >= ms) return null;
+      await new Promise<void>((r) => this.setT(r, 100));
+      waited += 100;
     }
   }
 
@@ -407,7 +563,7 @@ export class TelnyxTelephony implements Telephony {
 
     if (row.type === 'incoming') {
       if (this.calls.has(callId)) return;
-      const call: KnownCall = { direction: 'inbound', answered: false, ended: false, timers: [] };
+      const call: KnownCall = { direction: 'inbound', answered: false, ended: false, timers: [], device: row.message === INCOMING_ON_DEVICE };
       this.calls.set(callId, call);
       call.timers.push(
         this.setT(() => {
@@ -476,6 +632,12 @@ export class TelnyxTelephony implements Telephony {
     call.ended = true;
     for (const t of call.timers) this.clearT(t);
     call.timers = [];
+    if (call.direction === 'inbound') {
+      // Stop any SDK call still ringing / open for it (normally Telnyx has ended it already).
+      const sdk = call.sdk ?? this.deviceCalls.get(callId);
+      if (sdk && !sdk.ended) void sdk.hangup().catch(() => {});
+      this.deviceCalls.delete(callId);
+    }
     this.emit({ type: 'ended', callId, reason });
   }
 
@@ -521,6 +683,7 @@ export class TelnyxTelephony implements Telephony {
     const call = this.calls.get(callId);
     if (!call || call.ended) return;
     let res: { alreadyEnded?: boolean } | null = null;
+    if (call.sdk) void call.sdk.hangup().catch(() => {});
     try {
       res = await this.callAction('hangup', callId);
     } catch {
@@ -540,13 +703,15 @@ export class TelnyxTelephony implements Telephony {
     if (!call || call.ended || !call.answered) return;
     const clean = digits.replace(/[^0-9*#]/g, '');
     if (!clean) return;
-    // DTMF from the agent leg passes through the bridge to the lead.
-    this.agentCall?.dtmf(clean);
+    // Device calls carry their own audio; otherwise DTMF from the agent leg passes through the bridge.
+    if (call.sdk) call.sdk.dtmf(clean);
+    else this.agentCall?.dtmf(clean);
   }
 
   async setMuted(muted: boolean): Promise<void> {
     this.muted = muted;
     this.agentCall?.setMuted(muted);
+    for (const c of this.calls.values()) if (c.sdk && !c.ended) c.sdk.setMuted(muted);
   }
 
   async answerIncoming(callId: string): Promise<void> {
@@ -554,13 +719,41 @@ export class TelnyxTelephony implements Telephony {
     if (!call || call.direction !== 'inbound' || call.ended || call.answered) return;
     for (const t of call.timers) this.clearT(t);
     call.timers = [];
+    if (call.device || !this._connected) {
+      await this.answerOnDevice(callId, call);
+      return;
+    }
     try {
       const res = await this.callAction('answer', callId);
       if (res.alreadyEnded) call.timers.push(this.setT(() => this.emitEnded(callId, 'hangup_remote'), 3_000));
     } catch (e) {
+      // The server rang this device after all (the line opened while it was being offered).
+      if (this.findDeviceCall(callId)) {
+        await this.answerOnDevice(callId, call);
+        return;
+      }
       // e.g. the lead already hung up; the server's `ended` follows.
       this.emitError(e instanceof Error ? e.message : String(e));
     }
+  }
+
+  /**
+   * Answers a call that rings this device: microphone check (only when no line is open), then the
+   * SDK answer; the server bridges it to the person on its call.answered. Rejects with a message
+   * the caller can act on; the engine then declines the call.
+   */
+  private async answerOnDevice(callId: string, call: KnownCall): Promise<void> {
+    if (!this._connected) await (this.options.requestMicrophone ?? defaultRequestMicrophone)();
+    const sdk = await this.waitForDeviceCall(callId, DEVICE_CALL_WAIT_MS);
+    if (!sdk) {
+      if (call.ended) return; // gone meanwhile (someone else took it / the person hung up)
+      throw new Error('The call could not be connected to this computer. Check your internet connection.');
+    }
+    call.sdk = sdk;
+    this.deviceCalls.delete(callId);
+    await sdk.answer(this.muted);
+    // Server `answered` normally follows within a second or two; if the person already hung up the
+    // server `ended` arrives instead.
   }
 
   async declineIncoming(callId: string): Promise<void> {
@@ -568,6 +761,8 @@ export class TelnyxTelephony implements Telephony {
     if (!call || call.direction !== 'inbound' || call.ended) return;
     for (const t of call.timers) this.clearT(t);
     call.timers = [];
+    const sdk = call.sdk ?? this.deviceCalls.get(callId);
+    if (sdk) await sdk.hangup().catch(() => {});
     await this.callAction('decline', callId).catch(() => null);
     if (!call.ended) call.timers.push(this.setT(() => this.emitEnded(callId, 'hangup_local'), LOCAL_END_FALLBACK_MS));
   }

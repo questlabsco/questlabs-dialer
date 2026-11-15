@@ -82,6 +82,7 @@ serve(async (req) => {
         apiVersion: conn.webhook_api_version != null ? String(conn.webhook_api_version) : null,
         parking: conn.outbound?.call_parking_enabled === true,
         profileId: conn.outbound?.outbound_voice_profile_id ?? null,
+        sipUriCalling: conn.sip_uri_calling_preference != null ? String(conn.sip_uri_calling_preference) : null,
       };
     }
     const profileId = facts.voiceApp?.profileId ?? cfg?.outbound_voice_profile_id ?? null;
