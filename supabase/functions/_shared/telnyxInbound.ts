@@ -206,7 +206,16 @@ async function loadCandidates(): Promise<InboundCandidate[]> {
       .in('caller_id', ids)
       .in('status', ['answering', 'answered'])
       .gte('created_at', since),
-    db.from('telephony_calls').select('caller_id').in('caller_id', ids).eq('status', 'incoming').gte('created_at', recent),
+    // Only OFFERS count as "already ringing". The inbound call's own parent row is also 'incoming'
+    // and carries the caller who last dialed the number, so counting it marked exactly the person
+    // the call should go to as busy, and every callback fell straight through to the message.
+    db
+      .from('telephony_calls')
+      .select('caller_id')
+      .in('caller_id', ids)
+      .eq('status', 'incoming')
+      .like('call_session_id', `${offerTag('')}%`)
+      .gte('created_at', recent),
   ]);
   const cfg = await loadConfig().catch(() => null);
   const busy = new Set<string>();
