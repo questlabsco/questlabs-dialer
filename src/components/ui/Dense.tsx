@@ -1,5 +1,7 @@
 /** Dense enterprise building blocks: metrics band, table toolbar, highlights strip, field grid, help tip. */
-import type { CSSProperties, HTMLAttributes, ReactNode } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import type { CSSProperties, HTMLAttributes, KeyboardEvent, ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { IconArrowDown, IconArrowUp } from './icons';
 
 // ---------------------------------------------------------------------------
@@ -126,11 +128,90 @@ export function FieldGrid({ items, columns = 2, className }: { items: { key?: st
 // Help tip: the small "i" with the explanation in a tooltip.
 // ---------------------------------------------------------------------------
 
+const HELP_POP_WIDTH = 260;
+const HELP_POP_MARGIN = 8;
+
+/**
+ * Small "i" that explains a setting. The explanation opens in our own popover on hover, focus or
+ * click: the operating system's native tooltip does not appear in the desktop window.
+ */
 export function HelpTip({ text }: { text: string }) {
+  const id = useId();
+  const anchor = useRef<HTMLElement>(null);
+  const [pos, setPos] = useState<{ left: number; top: number; above: boolean } | null>(null);
+
+  const open = useCallback(() => {
+    const el = anchor.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const half = HELP_POP_WIDTH / 2;
+    const centre = r.left + r.width / 2;
+    const left = Math.min(Math.max(centre - half, HELP_POP_MARGIN), Math.max(HELP_POP_MARGIN, window.innerWidth - HELP_POP_WIDTH - HELP_POP_MARGIN));
+    // Open below unless there is too little room; then open above.
+    const above = r.bottom + 120 > window.innerHeight;
+    setPos({ left, top: above ? r.top - 6 : r.bottom + 6, above });
+  }, []);
+  const close = useCallback(() => setPos(null), []);
+
+  useEffect(() => {
+    if (!pos) return;
+    // Any scroll or resize would leave the popover pointing at the wrong place.
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => {
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+    };
+  }, [pos, close]);
+
+  const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
+    if (e.key === 'Escape' && pos) {
+      e.stopPropagation();
+      close();
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      if (pos) close();
+      else open();
+    }
+  };
+
   return (
-    <i className="help-tip" title={text} aria-label={text} role="img">
-      i
-    </i>
+    <>
+      <i
+        ref={anchor}
+        className="help-tip"
+        role="button"
+        tabIndex={0}
+        aria-label={text}
+        aria-describedby={pos ? id : undefined}
+        onMouseEnter={open}
+        onMouseLeave={close}
+        onFocus={open}
+        onBlur={close}
+        onClick={(e) => {
+          // Inside a label or a sortable header, a click must only show the help.
+          e.preventDefault();
+          e.stopPropagation();
+          open();
+        }}
+        onKeyDown={onKeyDown}
+      >
+        i
+      </i>
+      {pos &&
+        createPortal(
+          <div
+            id={id}
+            role="tooltip"
+            className={pos.above ? 'help-pop help-pop-above' : 'help-pop'}
+            style={{ left: pos.left, top: pos.top, width: HELP_POP_WIDTH }}
+          >
+            {text}
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }
 

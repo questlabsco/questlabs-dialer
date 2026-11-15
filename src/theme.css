@@ -2041,3 +2041,29 @@ html.frameless .login::before {
   height: var(--titlebar-height);
   -webkit-app-region: drag;
 }
+
+/* ---------- Help popover (the "i" next to a setting) ---------- */
+
+.help-pop {
+  position: fixed;
+  z-index: 1200;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-menu);
+  color: var(--text);
+  font-size: var(--font-xs);
+  font-weight: 400;
+  font-style: normal;
+  line-height: 1.45;
+  letter-spacing: 0;
+  text-transform: none;
+  text-align: left;
+  white-space: normal;
+  pointer-events: none;
+}
+
+.help-pop-above {
+  transform: translateY(-100%);
+}
