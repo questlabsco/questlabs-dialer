@@ -109,7 +109,9 @@ describe('statusView', () => {
     expect(hook.technical).toMatch(/old\.supabase\.co/);
     expect(hook.hint).toBe('Click Set up Telnyx to fix this.');
     for (const r of v.rows) {
-      expect(`${r.label} ${r.detail} ${r.hint ?? ''}`).not.toMatch(/telnyx-setup|webhook|WebRTC|credential connection/i);
+      // Real Telnyx resource names in quotes ("Quest Labs Dialer - WebRTC") are kept as they are.
+      const text = `${r.label} ${r.detail} ${r.hint ?? ''}`.replace(/"[^"]*"/g, '');
+      expect(text).not.toMatch(/telnyx-setup|webhook|WebRTC|credential connection/i);
     }
   });
   it('only the numbers are missing', () => {
@@ -123,6 +125,7 @@ describe('statusView', () => {
     expect(v.stage).toBe('ok');
     expect(v.collapsible).toBe(true);
     expect(v.rows.find((r) => r.key === 'voice_app_profile')!.detail).toBe('Allowed (profile "Quest Labs - US Outbound").');
+    expect(v.rows.find((r) => r.key === 'webrtc_connection')!.detail).toBe('Found "Quest Labs Dialer - WebRTC".');
     expect(v.rows.every((r) => r.hint === null)).toBe(true);
   });
   it('status call failure', () => {
