@@ -80,6 +80,15 @@ interface NextRing {
   fromNumber: string | null;
 }
 
+/** A call that was placed and logged, ready to be shown on a line. */
+interface PlacedRing {
+  ok: true;
+  from: string;
+  callId: string;
+  recordId: string;
+  startedAtMs: number;
+}
+
 interface Slot {
   index: number;
   status: 'empty' | 'ringing' | 'answered';
@@ -381,8 +390,8 @@ export class DialerEngine implements DialerControls {
         return;
       }
       this.detach(a.callId);
-      await this.hangupQuietly(a.callId);
-      await this.endActive();
+      // The screen moves on at once; the hang-up finishes while the wrap-up is already showing.
+      await this.endActive(this.hangupQuietly(a.callId));
     });
   }
 
@@ -533,6 +542,8 @@ export class DialerEngine implements DialerControls {
         this.commit({ manualEnded: null });
       }
 
+      // Looked up while the outbound number is picked, not after it.
+      const findingLead = this.safe('finding lead', this.api.findLeadByPhone(to));
       let num: PhoneNumber | null;
       try {
         num = await this.api.pickFromNumber(to);
@@ -543,7 +554,7 @@ export class DialerEngine implements DialerControls {
       const from = num.number;
 
       // Known leads are used as they are: not claimed or locked through the queue.
-      const found = (await this.safe('finding lead', this.api.findLeadByPhone(to))) ?? null;
+      const found = (await findingLead) ?? null;
       const lead = found ?? this.syntheticLead(to);
 
       let callId: string;
@@ -846,11 +857,18 @@ export class DialerEngine implements DialerControls {
         next: { ring: 1, phoneIdx: 0, fromNumber: null } satisfies NextRing,
       });
     });
-    for (const s of empty) {
-      if (!s.lead || !s.next) continue;
-      if (!(await this.ringNext(s))) return;
-      if (!this.canStartRings()) return;
+    // Ring every line at the same moment. One after another, each line started about a second
+    // after the one before it.
+    const targets = empty.filter((s) => s.lead && s.next);
+    const placed = await Promise.all(targets.map((s) => this.placeRing(s.lead!, s.phones[s.next!.phoneIdx], s.next!)));
+    let failure: string | null = null;
+    for (let i = 0; i < targets.length; i++) {
+      const p = placed[i];
+      if (p.ok) this.startRinging(targets[i], targets[i].next!, p);
+      else failure ??= p.message;
     }
+    // The lines that did start are hung up and their leads released by the fatal stop.
+    if (failure) await this.enterFatal(failure);
   }
 
   /** Rings `slot.next`. Returns false when a fatal error stopped the dialer. */
@@ -862,20 +880,29 @@ export class DialerEngine implements DialerControls {
       this.commit();
       return true;
     }
-    const phone = slot.phones[next.phoneIdx];
+    const placed = await this.placeRing(lead, slot.phones[next.phoneIdx], next);
+    if (!placed.ok) {
+      await this.enterFatal(placed.message);
+      return false;
+    }
+    this.startRinging(slot, next, placed);
+    return true;
+  }
+
+  /**
+   * Picks the outbound number, places the call and logs it. Changes no dialer state, so several
+   * lines can be placed at once; the caller applies the result with startRinging.
+   */
+  private async placeRing(lead: Lead, phone: string, next: NextRing): Promise<PlacedRing | { ok: false; message: string }> {
     let from = next.fromNumber;
     if (!from) {
       let num: PhoneNumber | null;
       try {
         num = await this.api.pickFromNumber(phone);
       } catch (e) {
-        await this.enterFatal(`Couldn't pick an outbound number: ${errorMessage(e)}`);
-        return false;
+        return { ok: false, message: `Couldn't pick an outbound number: ${errorMessage(e)}` };
       }
-      if (!num) {
-        await this.enterFatal(NO_CAPACITY_MESSAGE);
-        return false;
-      }
+      if (!num) return { ok: false, message: NO_CAPACITY_MESSAGE };
       from = num.number;
     }
 
@@ -891,12 +918,10 @@ export class DialerEngine implements DialerControls {
         record: this.settings.recordCalls,
       });
     } catch (e) {
-      await this.enterFatal(`Couldn't place the call: ${errorMessage(e)}`);
-      return false;
+      return { ok: false, message: `Couldn't place the call: ${errorMessage(e)}` };
     }
 
     const startedAtMs = this.now();
-    let recordId: string;
     try {
       const rec = await this.api.createCall({
         leadId: lead.id,
@@ -907,27 +932,29 @@ export class DialerEngine implements DialerControls {
         startedAt: this.iso(startedAtMs),
         providerCallId: callId,
       });
-      recordId = rec.id;
+      return { ok: true, from, callId, recordId: rec.id, startedAtMs };
     } catch (e) {
       await this.hangupQuietly(callId);
-      await this.enterFatal(`Couldn't log the call: ${errorMessage(e)}`);
-      return false;
+      return { ok: false, message: `Couldn't log the call: ${errorMessage(e)}` };
     }
+  }
 
+  /** Marks `slot` as ringing the call `placed` and arms its ring timeout. */
+  private startRinging(slot: Slot, next: NextRing, placed: PlacedRing): void {
+    const { callId } = placed;
     slot.status = 'ringing';
     slot.phoneIdx = next.phoneIdx;
     slot.ring = next.ring;
-    slot.fromNumber = from;
+    slot.fromNumber = placed.from;
     slot.callId = callId;
-    slot.callRecordId = recordId;
-    slot.startedAtMs = startedAtMs;
+    slot.callRecordId = placed.recordId;
+    slot.startedAtMs = placed.startedAtMs;
     slot.next = null;
     const ringMs = Math.max(1, this.settings.ringSeconds) * 1000 + RING_GRACE_MS;
     slot.timer = setTimeout(() => {
       void this.run(() => this.onRingTimeout(slot.index, callId)).catch((e) => warn('ring timeout', e));
     }, ringMs);
     this.commit({ session: this.bumpSession({ dials: this.state.session.dials + 1 }) });
-    return true;
   }
 
   /**
@@ -993,7 +1020,7 @@ export class DialerEngine implements DialerControls {
       Object.assign(s, emptySlot(s.index));
       if (callId) {
         if (result === 'dropped') this.rememberDropped(callId, recordId);
-        await this.hangupQuietly(callId);
+        updates.push(this.hangupQuietly(callId));
         if (recordId) updates.push(this.safe('dropping line', this.api.updateCall(recordId, { endedAt, result })));
       }
     }
@@ -1375,9 +1402,12 @@ export class DialerEngine implements DialerControls {
   // -------------------------------------------------------------------------
 
   /** The active call has ended (either side). Goes to wrap-up (or straight on for unknown callers). */
-  private async endActive(): Promise<void> {
+  private async endActive(hangingUp?: Promise<unknown>): Promise<void> {
     const a = this.active;
-    if (!a) return;
+    if (!a) {
+      await hangingUp;
+      return;
+    }
     this.active = null;
     this.detach(a.callId);
     if (a.manual && this.manual && this.manual.callId === a.callId) this.manual.status = 'done';
@@ -1392,17 +1422,21 @@ export class DialerEngine implements DialerControls {
       talkSeconds: s.talkSeconds + talkSeconds,
       conversations: s.conversations + (talkSeconds >= CONVERSATION_MIN_SECONDS ? 1 : 0),
     });
-    if (a.callRecordId) {
-      await this.safe('ending call', this.api.updateCall(a.callRecordId, { endedAt: this.iso(endMs), talkSeconds }));
-    }
+    // Saving the record and the hang-up run together; neither holds up what the caller sees.
+    const settled = Promise.all([
+      a.callRecordId ? this.safe('ending call', this.api.updateCall(a.callRecordId, { endedAt: this.iso(endMs), talkSeconds })) : null,
+      hangingUp,
+    ]);
     if (a.synthetic || !a.callRecordId) {
       this.commit({ session });
+      await settled;
       await this.afterCallDone();
       return;
     }
     this.wrap = { lead: a.lead, callRecordId: a.callRecordId, talkSeconds, ...(a.manual ? { manual: true } : {}) };
     this.presence('wrap_up', a.lead.businessName);
     this.commit({ phase: 'wrap_up', session });
+    await settled;
   }
 
   /** After a wrap-up (or a call that needs none): stop, fail, pause or keep dialing. */

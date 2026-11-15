@@ -161,6 +161,53 @@ describe('dialer engine: starting', () => {
     expect(rec).toMatchObject({ direction: 'outbound', ring: 1, result: null, leadId: t.lead('Biz 0').id });
   });
 
+  it('places both lines at the same moment, not one after the other', async () => {
+    const t = await setup({ leads: leadRows(2) });
+    // Dials that stay unanswered by the phone service until the test lets them through.
+    const waiting: (() => void)[] = [];
+    const realDial = t.tel.dial.bind(t.tel);
+    let asked = 0;
+    t.tel.dial = async (req) => {
+      asked++;
+      await new Promise<void>((r) => waiting.push(r));
+      return realDial(req);
+    };
+    const started = t.engine.start();
+    for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(0);
+    // The second line was dialed while the first was still being placed.
+    expect(asked).toBe(2);
+    expect(t.tel.dials).toHaveLength(0);
+    for (const go of waiting) go();
+    await started;
+    await t.settle();
+    expect(t.engine.getState().lines.map((l) => l.status)).toEqual(['ringing', 'ringing']);
+    expect(t.engine.getState().session.dials).toBe(2);
+  });
+
+  it('shows the wrap-up at once on hang up, before the phone service confirms it', async () => {
+    const t = await setup({ leads: leadRows(1), settings: { linesPerCaller: 1 } });
+    await t.engine.start();
+    await t.settle();
+    const [a] = t.tel.dials;
+    await t.emit({ type: 'answered', callId: a.callId });
+    let confirm!: () => void;
+    const realHangup = t.tel.hangup.bind(t.tel);
+    t.tel.hangup = async (callId) => {
+      await new Promise<void>((r) => (confirm = r));
+      return realHangup(callId);
+    };
+    const hanging = t.engine.hangUp();
+    for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(0);
+    expect(t.engine.getState().phase).toBe('wrap_up');
+    expect(t.tel.hangups).toHaveLength(0);
+    confirm();
+    await hanging;
+    await t.settle();
+    expect(t.tel.hangups).toEqual([a.callId]);
+    expect(t.engine.getState().phase).toBe('wrap_up');
+    expect(t.callFor(a.callId).endedAt).not.toBeNull();
+  });
+
   it('goes to error when telephony cannot connect', async () => {
     const t = await setup({ leads: leadRows(2) });
     t.tel.failConnect = new Error('Microphone access was denied');

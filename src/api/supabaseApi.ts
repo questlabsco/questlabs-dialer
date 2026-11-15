@@ -79,6 +79,7 @@ const HEARTBEAT_MS = 30_000;
 const PRESENCE_REFRESH_MS = 30_000;
 const IMPORT_CHUNK = 500;
 const EXPORT_PAGE = 1000;
+const EXPORT_PARALLEL = 4;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const clone = <T>(v: T): T => structuredClone(v);
@@ -529,8 +530,7 @@ export class SupabaseApi implements Api {
 
   async exportLeads(filter: LeadFilter): Promise<Lead[]> {
     await this.admin();
-    const out: Lead[] = [];
-    for (let page = 1; ; page++) {
+    const fetchPage = async (page: number) => {
       const res = await this.rpc<{ rows: Row[]; total: number }>('query_leads', {
         ...this.leadQueryArgs(filter),
         p_sort_field: 'created_at',
@@ -538,9 +538,17 @@ export class SupabaseApi implements Api {
         p_page: page,
         p_page_size: EXPORT_PAGE,
       });
-      const rows = this.rows(res?.rows);
-      out.push(...rows.map(leadFromRow));
-      if (rows.length < EXPORT_PAGE || out.length >= (Number(res?.total) || 0)) break;
+      return { leads: this.rows(res?.rows).map(leadFromRow), total: Number(res?.total) || 0 };
+    };
+    const first = await fetchPage(1);
+    const pages = Math.ceil(first.total / EXPORT_PAGE);
+    if (first.leads.length < EXPORT_PAGE || pages <= 1) return first.leads;
+    // The first page says how many there are; the rest load a few at a time, not one by one.
+    const out = first.leads;
+    for (let page = 2; page <= pages; page += EXPORT_PARALLEL) {
+      const count = Math.min(EXPORT_PARALLEL, pages - page + 1);
+      const batch = await Promise.all(Array.from({ length: count }, (_, i) => fetchPage(page + i)));
+      for (const b of batch) out.push(...b.leads);
     }
     return out;
   }

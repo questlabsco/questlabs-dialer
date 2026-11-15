@@ -172,7 +172,9 @@ export const createTelnyxRtc: RtcFactory = (callbacks) => {
   return {
     async connect(token) {
       const { TelnyxRTC } = await import('@telnyx/webrtc');
-      const c = new TelnyxRTC({ login_token: token }) as unknown as SdkClient;
+      // Without these two the SDK holds every call back (up to a second) while it collects network
+      // routes; with them it starts the call at once and sends the routes as they are found.
+      const c = new TelnyxRTC({ login_token: token, trickleIce: true, prefetchIceCandidates: true }) as unknown as SdkClient;
       client = c;
       c.on('telnyx.notification', onNotification);
       await new Promise<void>((resolve, reject) => {

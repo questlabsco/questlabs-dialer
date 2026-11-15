@@ -38,30 +38,26 @@ serve(async (req) => {
   if (typeof body.leadId !== 'string' || !body.leadId) throw new HttpError(400, 'leadId is required.', 'invalid');
   const ring = body.ring === 2 ? 2 : 1;
 
-  const cfg = await requireConfig();
-  const settings = await loadSettings();
-
-  const { data: fromRow } = await db
-    .from('phone_numbers')
-    .select('id')
-    .eq('number', body.from)
-    .eq('active', true)
-    .maybeSingle();
+  // These five lookups do not depend on each other, so they run together: every call waits on them.
+  // Ringing legs older than 15 min are ignored so a lost webhook can never block a caller forever.
+  const since = new Date(Date.now() - 15 * 60_000).toISOString();
+  const [cfg, settings, { data: fromRow }, agent, { count }] = await Promise.all([
+    requireConfig(),
+    loadSettings(),
+    db.from('phone_numbers').select('id').eq('number', body.from).eq('active', true).maybeSingle(),
+    liveAgentSession(user.id),
+    db
+      .from('telephony_calls')
+      .select('id', { count: 'exact', head: true })
+      .eq('caller_id', user.id)
+      .eq('direction', 'outbound')
+      .in('status', ['dialing', 'ringing'])
+      .gte('created_at', since),
+  ]);
   if (!fromRow) throw new HttpError(400, 'That outbound number is not one of our active numbers.', 'invalid');
-
-  const agent = await liveAgentSession(user.id);
   if (!agent) throw new HttpError(409, 'Your audio session is not connected. Press Start again.', 'no_agent_leg');
 
-  // Cap simultaneous ringing legs (lines + 1 for the double-ring overlap). Rows older than 15 min
-  // are ignored so a lost webhook can never block a caller forever.
-  const since = new Date(Date.now() - 15 * 60_000).toISOString();
-  const { count } = await db
-    .from('telephony_calls')
-    .select('id', { count: 'exact', head: true })
-    .eq('caller_id', user.id)
-    .eq('direction', 'outbound')
-    .in('status', ['dialing', 'ringing'])
-    .gte('created_at', since);
+  // Cap simultaneous ringing legs (lines + 1 for the double-ring overlap).
   if ((count ?? 0) >= settings.lines_per_caller + 1) {
     throw new HttpError(429, 'Too many lines are ringing at once.', 'too_many_lines');
   }

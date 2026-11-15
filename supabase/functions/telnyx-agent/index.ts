@@ -35,9 +35,8 @@ serve(async (req) => {
 
   switch (body.action) {
     case 'start': {
-      await requireConfig();
       // A caller has one agent leg at a time: close any previous one (e.g. after a crash).
-      await endSessions(user.id);
+      await Promise.all([requireConfig(), endSessions(user.id)]);
       const { data, error } = await db
         .from('agent_sessions')
         .insert({ caller_id: user.id, status: 'pending' })
