@@ -31,7 +31,7 @@ import type { DialerControls, DialerSessionStats, DialerState, LineState } from 
 import { formatDuration, formatDurationLong, formatNumber, formatPercent, formatPhone } from '../../lib/format';
 import { CallBar } from './CallBar';
 import { LeadHighlights, LeadPanel } from './LeadPanel';
-import { ManualDial } from './ManualDial';
+import { ManualDial, TonePad } from './ManualDial';
 import { MicCheck } from './MicCheck';
 import ScriptPanel from './ScriptPanel';
 import { WrapUpPanel } from './WrapUpPanel';
@@ -344,11 +344,11 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
                 {callbacksDue ? ' Due callbacks are dialed first.' : ''}
               </p>
             </div>
-            {manualDial}
           </section>
           <TodayStats stats={statsToday} callbacksDue={callbacksDue} />
         </div>
         <div className="stack dl-side-col">
+          {manualDial}
           <MicCheck />
           <ScriptPanel lead={null} callerName={callerName} />
         </div>
@@ -476,7 +476,7 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
           onDigit={(d) => void controls.sendDigits(d).catch((e) => toast.error(errorMessage(e)))}
         />
         <LeadHighlights lead={lead} phoneInUse={activePhone} />
-        <div className="dl-grid dl-grid-even">
+        <div className="dl-grid dl-grid-call">
           <ScriptPanel lead={lead} callerName={callerName} />
           <Card title="Notes" actions={<span className="muted dl-small">Kept for wrap-up</span>} className="dl-notes-card">
             <Textarea
@@ -487,6 +487,7 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
               onChange={(e) => updateDraft({ notes: e.target.value })}
             />
           </Card>
+          <TonePad onDigit={(d) => void controls.sendDigits(d).catch((e) => toast.error(errorMessage(e)))} />
         </div>
         <LeadPanel lead={lead} phoneInUse={activePhone} callerId={callerId} data={data} currentCallRecordId={call.callRecordId} onSaveField={saveLeadField} />
       </>

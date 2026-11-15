@@ -24,6 +24,16 @@
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
 }
 
+/* Live call: script, notes and the keypad side by side. */
+.dl-grid.dl-grid-call {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 264px;
+  gap: var(--space-6);
+}
+
+@media (max-width: 1239px) {
+  .dl-grid.dl-grid-call { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+}
+
 .dl-grid > .dl-main-col,
 .dl-grid > .dl-side-col {
   min-width: 0;
@@ -32,7 +42,8 @@
 
 @media (max-width: 899px) {
   .dl-grid,
-  .dl-grid.dl-grid-even { grid-template-columns: minmax(0, 1fr); }
+  .dl-grid.dl-grid-even,
+  .dl-grid.dl-grid-call { grid-template-columns: minmax(0, 1fr); }
 }
 
 .dl-center {
@@ -119,37 +130,140 @@
   font-weight: 600;
 }
 
-/* "Call a number" (idle hero and paused card) */
-.dl-manual {
+/* Dial pad: number field on top, keys below (idle side column, paused card, live call) */
+.dl-pad {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-3);
+  width: 100%;
+  max-width: 264px;
   min-width: 0;
-  max-width: 100%;
 }
 
-.dl-manual-row {
+.dl-pad-title {
+  font-size: var(--font-md);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.dl-pad-entry {
   display: flex;
   align-items: center;
   gap: var(--space-2);
 }
 
-.dl-manual-input.input {
-  width: 200px;
-  max-width: 100%;
+.dl-pad-input.input {
+  flex: 1 1 auto;
   min-width: 0;
-  flex: 0 1 200px;
+  height: 40px;
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
   font-variant-numeric: tabular-nums;
 }
 
-.dl-hero .dl-manual {
-  padding-top: var(--space-4);
-  border-top: 1px solid var(--border-subtle);
+.dl-pad-del {
+  flex: none;
+  height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--font-sm);
+  cursor: pointer;
 }
 
-.dl-center .dl-manual {
+.dl-pad-del:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.dl-pad-del:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.dl-pad-keys {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.dl-pad-key {
+  display: flex;
+  flex-direction: column;
   align-items: center;
-  margin-top: var(--space-6);
+  justify-content: center;
+  height: 52px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.dl-pad-key:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.dl-pad-key:active:not(:disabled) {
+  background: var(--surface-3, var(--surface-2));
+}
+
+.dl-pad-key:focus-visible,
+.dl-pad-del:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.dl-pad-key:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.dl-pad-digit {
+  font-size: 19px;
+  font-weight: 500;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.dl-pad-letters {
+  min-height: 11px;
+  font-size: 9.5px;
+  line-height: 1.1;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.dl-pad-sent {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.dl-pad-sent-empty {
+  font-size: var(--font-sm);
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--text-muted);
+}
+
+.dl-center .dl-pad {
+  margin-top: var(--space-5);
   text-align: left;
 }
 
