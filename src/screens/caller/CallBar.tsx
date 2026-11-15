@@ -80,7 +80,7 @@ export function CallBar({ call, businessName, contactName, email = '', now, onTo
   const unknown = isUnknownLead(call.lead);
   const otherParty = call.direction === 'inbound' ? call.fromNumber : call.toNumber;
   const title = unknown ? formatPhone(otherParty) : businessName || formatPhone(otherParty);
-  const sub = unknown ? 'Unknown caller' : [contactName, formatPhone(otherParty)].filter(Boolean).join(' · ');
+  const sub = unknown ? (call.manual ? 'Not in your leads' : 'Unknown caller') : [contactName, formatPhone(otherParty)].filter(Boolean).join(' · ');
 
   const closeKeypad = (returnFocus: boolean) => {
     setKeypadOpen(false);
@@ -93,6 +93,7 @@ export function CallBar({ call, businessName, contactName, email = '', now, onTo
         <div className="row dl-wrap dl-callbar-status">
           <span className="dl-callbar-state">Connected</span>
           {call.direction === 'inbound' && <Badge tone="accent">Incoming call</Badge>}
+          {call.manual && <Badge>Manual call</Badge>}
           {call.muted && <Badge tone="warning">Muted</Badge>}
         </div>
         <div className="dl-callbar-title">{title}</div>

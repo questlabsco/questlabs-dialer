@@ -102,6 +102,7 @@ const NOOP_CONTROLS: DialerControls = {
   submitDisposition: noop,
   answerIncoming: noop,
   declineIncoming: noop,
+  callNumber: noop,
 };
 
 const DEMO_CALENDLY = 'https://calendly.com/questlabs-demo/intro-call';

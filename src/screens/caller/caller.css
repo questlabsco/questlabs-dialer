@@ -119,6 +119,45 @@
   font-weight: 600;
 }
 
+/* "Call a number" (idle hero and paused card) */
+.dl-manual {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.dl-manual-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.dl-manual-input.input {
+  width: 200px;
+  max-width: 100%;
+  min-width: 0;
+  flex: 0 1 200px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dl-hero .dl-manual {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.dl-center .dl-manual {
+  align-items: center;
+  margin-top: var(--space-6);
+  text-align: left;
+}
+
+.dl-center .dl-manual .field-error,
+.dl-center .dl-manual .field-hint {
+  text-align: center;
+}
+
 .dl-callbacks-due {
   color: var(--accent-text);
 }

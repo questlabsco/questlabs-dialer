@@ -4,7 +4,9 @@ import {
   callbackQuickPicks,
   countDueCallbacks,
   dispositionForHotkey,
+  formatPhoneAsTyped,
   groupCallbacks,
+  manualEndedText,
   isCalendlyConfigured,
   isEditableTarget,
   isFutureTime,
@@ -182,5 +184,39 @@ describe('misc helpers', () => {
     expect(secondsSince(new Date(NOW - 65_400).toISOString(), NOW)).toBe(65);
     expect(secondsSince(new Date(NOW + 5_000).toISOString(), NOW)).toBe(0);
     expect(secondsSince(null, NOW)).toBe(0);
+  });
+});
+
+describe('manual dialing helpers', () => {
+  it('formats a US number as it is typed', () => {
+    expect(formatPhoneAsTyped('')).toBe('');
+    expect(formatPhoneAsTyped('2')).toBe('2');
+    expect(formatPhoneAsTyped('214')).toBe('214');
+    expect(formatPhoneAsTyped('2145')).toBe('(214) 5');
+    expect(formatPhoneAsTyped('214555')).toBe('(214) 555');
+    expect(formatPhoneAsTyped('2145550')).toBe('(214) 555-0');
+    expect(formatPhoneAsTyped('2145550123')).toBe('(214) 555-0123');
+    // Backspacing over the separators does not get stuck.
+    expect(formatPhoneAsTyped('(214) ')).toBe('214');
+    expect(formatPhoneAsTyped('(214) 555-')).toBe('(214) 555');
+  });
+
+  it('accepts pasted numbers in common formats', () => {
+    expect(formatPhoneAsTyped('214.555.0123')).toBe('(214) 555-0123');
+    expect(formatPhoneAsTyped('214-555-0123')).toBe('(214) 555-0123');
+    expect(formatPhoneAsTyped('+1 214 555 0123')).toBe('+1 (214) 555-0123');
+    expect(formatPhoneAsTyped('1-214-555-0123')).toBe('+1 (214) 555-0123');
+    expect(formatPhoneAsTyped('+12145550123')).toBe('+1 (214) 555-0123');
+  });
+
+  it('leaves anything else as typed', () => {
+    expect(formatPhoneAsTyped('+44 20 7946 0958')).toBe('+44 20 7946 0958');
+    expect(formatPhoneAsTyped('214555012345')).toBe('214555012345');
+    expect(formatPhoneAsTyped('214-555-0123 x12')).toBe('214-555-0123 x12');
+  });
+
+  it('describes how a manual call ended', () => {
+    expect(manualEndedText('no_answer', '(214) 555-0123')).toBe('No answer from (214) 555-0123');
+    expect(manualEndedText('busy', '(214) 555-0123')).toBe('(214) 555-0123 was busy');
   });
 });

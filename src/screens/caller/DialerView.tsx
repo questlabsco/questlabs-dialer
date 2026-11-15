@@ -13,6 +13,7 @@ import {
   IconPause,
   IconPhone,
   IconPhoneIncoming,
+  IconPhoneOff,
   IconPlay,
   IconStop,
   PageHeader,
@@ -30,11 +31,12 @@ import type { DialerControls, DialerSessionStats, DialerState, LineState } from 
 import { formatDuration, formatDurationLong, formatNumber, formatPercent, formatPhone } from '../../lib/format';
 import { CallBar } from './CallBar';
 import { LeadHighlights, LeadPanel } from './LeadPanel';
+import { ManualDial } from './ManualDial';
 import { MicCheck } from './MicCheck';
 import ScriptPanel from './ScriptPanel';
 import { WrapUpPanel } from './WrapUpPanel';
 import { clearCallDraft, useCallDraft, useLeadEdits, useNow } from './callerHooks';
-import { isEditableTarget, isUnknownLead, resolveShortcut, secondsSince, wrapUpValidation } from './dialerLogic';
+import { isEditableTarget, isUnknownLead, manualEndedText, resolveShortcut, secondsSince, wrapUpValidation } from './dialerLogic';
 import './caller.css';
 
 export interface DialerDataSource {
@@ -100,16 +102,19 @@ function LineCard({ line, now, ringSeconds }: { line: LineState; now: number; ri
   const pct = ringSeconds > 0 ? Math.min(100, (elapsed / ringSeconds) * 100) : 0;
   const answered = line.status === 'answered';
   const phoneIdx = line.lead.phones.indexOf(line.phone);
+  const unknown = isUnknownLead(line.lead);
   return (
-    <div className={`dl-line${answered ? ' dl-line-answered' : ''}`} aria-label={`Line ${line.index + 1}`}>
+    <div className={`dl-line${answered ? ' dl-line-answered' : ''}`} aria-label={line.manual ? 'Manual call' : `Line ${line.index + 1}`}>
       <span className="dl-line-no">Line {line.index + 1}</span>
       <span className="dl-line-status">
         {answered ? <Badge tone="good">Picked up</Badge> : <Badge tone="accent">Ringing</Badge>}
         {line.ring === 2 && <Badge tone="warning">2nd ring</Badge>}
       </span>
       <span className="dl-line-who">
-        <span className="dl-line-business">{line.lead.businessName || formatPhone(line.phone)}</span>
-        <span className="dl-line-contact">{line.lead.contactName || <span className="muted">No contact name</span>}</span>
+        <span className="dl-line-business">{(!unknown && line.lead.businessName) || formatPhone(line.phone)}</span>
+        <span className="dl-line-contact">
+          {unknown ? <span className="muted">Not in your leads</span> : line.lead.contactName || <span className="muted">No contact name</span>}
+        </span>
       </span>
       <span className="dl-line-meta">
         <span className="num">
@@ -185,6 +190,27 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [getEdit, setEdit] = useLeadEdits();
+  // "Call a number" field; kept here so it survives the idle -> connecting -> idle round trip.
+  const [manualValue, setManualValue] = useState('');
+  const [manualError, setManualError] = useState<string | null>(null);
+  /** Number being placed by callNumber (until it rings or fails). */
+  const [manualCalling, setManualCalling] = useState<string | null>(null);
+
+  const callManual = useCallback(
+    async (e164: string) => {
+      setManualCalling(e164);
+      setManualError(null);
+      try {
+        await controls.callNumber(e164);
+        setManualValue('');
+      } catch (e) {
+        setManualError(errorMessage(e));
+      } finally {
+        setManualCalling(null);
+      }
+    },
+    [controls],
+  );
 
   const callRecordId = state.activeCall?.callRecordId ?? state.wrapUp?.callRecordId ?? null;
   const [draft, updateDraft] = useCallDraft(callRecordId);
@@ -262,6 +288,7 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
         altKey: e.altKey,
         inEditable: isEditableTarget(target as { tagName?: string; isContentEditable?: boolean } | null),
         phase: h.state.phase,
+        manualRinging: h.state.lines.some((l) => l.manual && l.status === 'ringing'),
       });
       if (!action) return;
       e.preventDefault();
@@ -287,6 +314,20 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
   const ringSeconds = settings?.ringSeconds ?? 22;
   const lines = settings?.linesPerCaller ?? 2;
   const { phase } = state;
+  const manualLine = state.lines.find((l) => l.manual) ?? null;
+  const manualActive = !!manualLine || !!state.activeCall?.manual || !!state.wrapUp?.manual;
+
+  const manualDial = (
+    <ManualDial
+      value={manualValue}
+      onChange={setManualValue}
+      error={manualError}
+      onError={setManualError}
+      calling={manualCalling !== null}
+      onCall={(e164) => void callManual(e164)}
+      note={state.manualEnded ? manualEndedText(state.manualEnded.result, formatPhone(state.manualEnded.phone)) : null}
+    />
+  );
 
   let body: ReactNode;
   if (phase === 'idle') {
@@ -303,6 +344,7 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
                 {callbacksDue ? ' Due callbacks are dialed first.' : ''}
               </p>
             </div>
+            {manualDial}
           </section>
           <TodayStats stats={statsToday} callbacksDue={callbacksDue} />
         </div>
@@ -317,13 +359,56 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
       <Card>
         <div className="dl-center">
           <Spinner size={22} label="Connecting" />
-          <h2 className="dl-hero-title">Connecting</h2>
-          <p className="muted">Starting your line and loading leads</p>
+          <h2 className="dl-hero-title">{manualCalling ? `Calling ${formatPhone(manualCalling)}` : 'Connecting'}</h2>
+          <p className="muted">{manualCalling ? 'Starting your line' : 'Starting your line and loading leads'}</p>
           <Button variant="ghost" icon={<IconStop size={15} />} loading={busy === 'stop'} onClick={() => void run('stop', () => controls.stop())}>
             Cancel
           </Button>
         </div>
       </Card>
+    );
+  } else if (phase === 'dialing' && manualLine) {
+    const known = manualLine.lead && !isUnknownLead(manualLine.lead) ? manualLine.lead : null;
+    body = (
+      <div className="dl-grid">
+        <div className="stack dl-main-col">
+          <div className="data-panel">
+            <Toolbar
+              className="dl-toolbar"
+              count={
+                <>
+                  <strong>Manual call</strong> to {formatPhone(manualLine.phone)}
+                </>
+              }
+              right={
+                <Button
+                  size="sm"
+                  variant="danger"
+                  icon={<IconPhoneOff size={13} />}
+                  aria-keyshortcuts="H"
+                  loading={busy === 'hangup'}
+                  onClick={() => void run('hangup', () => controls.hangUp())}
+                >
+                  Hang up <kbd className="dl-kbd dl-kbd-on-color">H</kbd>
+                </Button>
+              }
+            />
+            <div className="dl-lines">
+              <div className="dl-lines-head" aria-hidden="true">
+                <span>Line</span>
+                <span>Status</span>
+                <span>Business</span>
+                <span>Phone</span>
+                <span className="align-right">Ring</span>
+              </div>
+              <LineCard line={manualLine} now={now} ringSeconds={ringSeconds} />
+            </div>
+          </div>
+        </div>
+        <div className="stack dl-side-col">
+          <ScriptPanel lead={known} callerName={callerName} />
+        </div>
+      </div>
     );
   } else if (phase === 'dialing') {
     body = (
@@ -429,6 +514,7 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
             pauseRequested={state.pauseRequested}
             onRequestPause={() => void run('pause', () => controls.pause())}
             onSaveEmail={(email) => saveLeadField('email', email)}
+            manual={!!state.wrapUp.manual}
           />
         </div>
         <div className="stack dl-side-col">
@@ -451,6 +537,7 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
               Stop
             </Button>
           </div>
+          {manualDial}
         </div>
       </Card>
     );
@@ -488,14 +575,14 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
   const statusBadge: Record<DialerState['phase'], ReactNode> = {
     idle: <Badge>Not dialing</Badge>,
     starting: <Badge tone="accent">Connecting</Badge>,
-    dialing: <Badge tone="accent">Dialing</Badge>,
+    dialing: <Badge tone="accent">{manualLine ? 'Calling' : 'Dialing'}</Badge>,
     connected: <Badge tone="good">On a call</Badge>,
     wrap_up: <Badge tone="warning">Wrap-up</Badge>,
     paused: <Badge>Paused</Badge>,
     error: <Badge tone="critical">Stopped</Badge>,
   };
 
-  const showStrip = phase !== 'idle' && state.session.startedAt !== null;
+  const showStrip = phase !== 'idle' && state.session.startedAt !== null && !manualActive && !(phase === 'starting' && manualCalling);
 
   return (
     <div className="screen dl-screen">

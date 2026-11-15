@@ -2,7 +2,7 @@
  * Public shape of the power dialer. The DialerScreen renders DialerState and calls DialerControls;
  * nothing else about the engine is public.
  */
-import type { Disposition, Lead } from '../types';
+import type { CallResult, Disposition, Lead } from '../types';
 
 export type DialerPhase =
   /** Not started (or stopped). */
@@ -34,6 +34,8 @@ export interface LineState {
   callId: string | null;
   /** ISO, when this ring started; null when empty. */
   startedAt: string | null;
+  /** A number the caller dialed by hand (callNumber); the only line while it rings / is answered. */
+  manual?: boolean;
 }
 
 export interface ActiveCall {
@@ -48,6 +50,8 @@ export interface ActiveCall {
   answeredAt: string;
   muted: boolean;
   direction: 'outbound' | 'inbound';
+  /** Placed by hand with callNumber (not from the lead queue). */
+  manual?: boolean;
 }
 
 export interface WrapUp {
@@ -55,6 +59,17 @@ export interface WrapUp {
   /** CallRecord id the disposition is saved against. */
   callRecordId: string;
   talkSeconds: number;
+  /** Wrap-up for a manual call to a known lead; afterwards the dialer returns to idle / paused. */
+  manual?: boolean;
+}
+
+/** How the last manual call ended when nobody was connected (not set when we cancelled it). */
+export interface ManualCallEnd {
+  /** E.164 number that was dialed. */
+  phone: string;
+  result: CallResult;
+  /** ISO. */
+  endedAt: string;
 }
 
 export interface IncomingCall {
@@ -89,6 +104,8 @@ export interface DialerState {
   pauseRequested: boolean;
   session: DialerSessionStats;
   error: string | null;
+  /** Set when a manual call rang out / was busy / failed; cleared by the next callNumber or start. */
+  manualEnded?: ManualCallEnd | null;
 }
 
 export interface SubmitDispositionInput {
@@ -114,6 +131,14 @@ export interface DialerControls {
   submitDisposition(input: SubmitDispositionInput): Promise<void>;
   answerIncoming(): Promise<void>;
   declineIncoming(): Promise<void>;
+  /**
+   * Rings one number typed by the caller (any common US format). Only while idle or paused; rejects
+   * with a message to show otherwise or when the number is invalid. From idle the audio session is
+   * opened just for this call and closed again afterwards; from paused the dialer returns to paused.
+   * A known lead goes through wrap-up after the call; other numbers do not. hangUp() cancels it
+   * while it is still ringing.
+   */
+  callNumber(phone: string): Promise<void>;
 }
 
 export const INITIAL_DIALER_STATE: DialerState = {

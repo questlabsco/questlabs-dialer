@@ -473,6 +473,11 @@ function guessFromHeader(header: string): HeaderGuess {
   const w = h.split(' ');
   // Never phones / not lead data.
   if (has(w, 'fax')) return { field: null, score: 0, contentCap: 0.3 };
+  // "categoryName", "Business Category", "Niche", "Rating", "reviewsCount", "Opening hours" (map-scraper
+  // exports) describe the business; they are never its name, even when the values read like one.
+  if (/categor|niche|sector|vertical|rating|review|hours/.test(h)) {
+    return { field: null, score: 0, keepExtra: /categor|niche|sector|vertical/.test(h), contentCap: 0.3 };
+  }
   if (/\b(account|contact|lead|record|deal) owner\b/.test(h)) return { field: null, score: 0, contentCap: 0.3 };
   if (has(w, 'status', 'confidence', 'verified', 'valid', 'type', 'source', 'count', 'date', 'id', 'score', 'stage') && !has(w, 'state')) {
     // "Email Status", "Phone Type", "Lead Source" … describe a value; they are not the value.
@@ -503,6 +508,9 @@ function guessFromHeader(header: string): HeaderGuess {
     w, 'address', 'street', 'website', 'url', 'domain', 'linkedin', 'facebook', 'twitter', 'size', 'industry',
     'revenue', 'employees', 'zip', 'postal', 'postcode', 'country', 'keywords', 'founded', 'sic', 'naics', 'code',
   );
+  // A bare "title" is a job title in contact exports (Owner, Founder) but the business's name in
+  // map-scraper exports, so let the cell contents decide instead of ruling it out.
+  if (h === 'title') return { field: null, score: 0, keepExtra: true };
   if (has(w, 'title', 'website', 'industry', 'url', 'domain') && !has(w, 'name')) return { field: null, score: 0, keepExtra: true, contentCap: 0.3 };
   if (notBusiness) return { field: null, score: 0, contentCap: 0.3 };
   if (!notBusiness && (has(w, 'owner', 'contact', 'person', 'decision', 'principal', 'representative', 'rep', 'proprietor') || /^(full name|name|person name|customer name|client name|lead name|prospect name)$/.test(h))) {

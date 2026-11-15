@@ -64,6 +64,13 @@ describe('dialer fixtures', () => {
     expect(isUnknownLead(fixtures.connected_unknown.state.activeCall?.lead)).toBe(true);
     expect(fixtures.wrap_up_no_email.state.wrapUp?.lead.email).toBe('');
     expect(fixtures.wrap_up_pause_requested.state.pauseRequested).toBe(true);
+    expect(fixtures.manual_ringing.state.lines).toEqual([expect.objectContaining({ manual: true, status: 'ringing' })]);
+    expect(isUnknownLead(fixtures.manual_ringing.state.lines[0].lead)).toBe(true);
+    expect(fixtures.manual_connected.state.activeCall?.manual).toBe(true);
+    expect(isUnknownLead(fixtures.manual_connected.state.activeCall?.lead)).toBe(true);
+    expect(isUnknownLead(fixtures.manual_connected_lead.state.activeCall?.lead)).toBe(false);
+    expect(fixtures.manual_wrap_up.state.wrapUp?.manual).toBe(true);
+    expect(fixtures.idle_manual_ended.state.manualEnded?.result).toBe('no_answer');
   });
 
   for (const name of FIXTURE_NAMES) {

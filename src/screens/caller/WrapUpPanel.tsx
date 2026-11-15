@@ -87,9 +87,11 @@ export interface WrapUpPanelProps {
   onRequestPause: () => void;
   /** No longer used here (email is edited in the lead details); kept so callers compile. */
   onSaveEmail?: (email: string) => Promise<void>;
+  /** Wrap-up for a manual call: no "Pause after this call" (the dialer goes back by itself). */
+  manual?: boolean;
 }
 
-export function WrapUpPanel({ lead, talkSeconds, draft, onDraft, now, saving, error, onSave, pauseRequested, onRequestPause }: WrapUpPanelProps) {
+export function WrapUpPanel({ lead, talkSeconds, draft, onDraft, now, saving, error, onSave, pauseRequested, onRequestPause, manual = false }: WrapUpPanelProps) {
   const selected = draft.disposition ? dispositionInfo(draft.disposition) : null;
   const pick = (d: Disposition) => onDraft({ disposition: d });
   const unknown = isUnknownLead(lead);
@@ -133,15 +135,17 @@ export function WrapUpPanel({ lead, talkSeconds, draft, onDraft, now, saving, er
 
         <Textarea label="Notes" rows={4} value={draft.notes} placeholder="What they said, what the next call should know" onChange={(e) => onDraft({ notes: e.target.value })} />
 
-        <Checkbox
-          label="Pause after this call"
-          checked={pauseRequested}
-          disabled={pauseRequested}
-          onChange={(checked) => {
-            if (checked) onRequestPause();
-          }}
-          hint={pauseRequested ? 'Dialing pauses when you save' : undefined}
-        />
+        {!manual && (
+          <Checkbox
+            label="Pause after this call"
+            checked={pauseRequested}
+            disabled={pauseRequested}
+            onChange={(checked) => {
+              if (checked) onRequestPause();
+            }}
+            hint={pauseRequested ? 'Dialing pauses when you save' : undefined}
+          />
+        )}
 
         {error && (
           <div className="form-error" role="alert">
@@ -151,7 +155,7 @@ export function WrapUpPanel({ lead, talkSeconds, draft, onDraft, now, saving, er
 
         <div className="row dl-wrap">
           <Button variant="primary" size="lg" loading={saving} onClick={onSave} aria-keyshortcuts={IS_MAC ? 'Meta+Enter' : 'Control+Enter'}>
-            {pauseRequested ? 'Save & pause' : 'Save & continue'}
+            {manual ? 'Save' : pauseRequested ? 'Save & pause' : 'Save & continue'}
           </Button>
           <span className="muted dl-small">
             <kbd className="dl-kbd">{SAVE_SHORTCUT_LABEL}</kbd> save · <kbd className="dl-kbd">1</kbd>-<kbd className="dl-kbd">7</kbd> outcome

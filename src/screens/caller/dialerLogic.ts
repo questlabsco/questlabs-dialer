@@ -110,6 +110,8 @@ export interface ShortcutInput {
   /** True when focus is in an input / textarea / select / contenteditable. */
   inEditable: boolean;
   phase: DialerPhase;
+  /** A manual call is ringing (H cancels it). */
+  manualRinging?: boolean;
 }
 
 /** Disposition for a hotkey '1'..'7', or null. */
@@ -121,7 +123,8 @@ export function dispositionForHotkey(key: string): DispositionInfo | null {
  * Maps a key press to a dialer action.
  * - Ctrl/Cmd+Enter in wrap-up saves (also from inside the notes box).
  * - Everything else never fires while typing in a field or with a modifier held:
- *   M = mute and H = hang up while connected; 1–7 = pick an outcome in wrap-up.
+ *   M = mute and H = hang up while connected (H also cancels a ringing manual call);
+ *   1–7 = pick an outcome in wrap-up.
  */
 export function resolveShortcut(e: ShortcutInput): ShortcutAction | null {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.altKey) {
@@ -133,6 +136,9 @@ export function resolveShortcut(e: ShortcutInput): ShortcutAction | null {
     if (k === 'm') return { type: 'mute' };
     if (k === 'h') return { type: 'hang_up' };
     return null;
+  }
+  if (e.phase === 'dialing' && e.manualRinging) {
+    return k === 'h' ? { type: 'hang_up' } : null;
   }
   if (e.phase === 'wrap_up') {
     const d = dispositionForHotkey(k);
@@ -188,6 +194,49 @@ export function isCalendlyConfigured(url: string | null | undefined): boolean {
 /** Loose email check for the inline email field. */
 export function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+// ---------------------------------------------------------------------------
+// Manual dialing
+// ---------------------------------------------------------------------------
+
+/**
+ * Formats a US number while it is typed: "2145" -> "(214) 5", "2145550123" -> "(214) 555-0123",
+ * "12145550123" / "+1 214..." -> "+1 (214) 555-0123". Anything else (another country, too many
+ * digits, letters) is left as typed so the caller can see what they entered.
+ */
+export function formatPhoneAsTyped(input: string): string {
+  const trimmed = input.trimStart();
+  if (/[^\d\s().+-]/.test(trimmed)) return input;
+  let digits = trimmed.replace(/\D/g, '');
+  if (trimmed.startsWith('+') && !digits.startsWith('1')) return input;
+  let prefix = '';
+  if (digits.startsWith('1')) {
+    prefix = '+1 ';
+    digits = digits.slice(1);
+  }
+  if (digits.length > 10) return input;
+  if (digits.length === 0) return prefix ? '+1' : '';
+  let body: string;
+  if (digits.length <= 3) body = digits;
+  else if (digits.length <= 6) body = `(${digits.slice(0, 3)}) ${digits.slice(3)}`;
+  else body = `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+  return prefix + body;
+}
+
+/** Plain sentence for how a manual call ended without anyone connected. */
+export function manualEndedText(result: string, phone: string): string {
+  switch (result) {
+    case 'busy':
+      return `${phone} was busy`;
+    case 'bad_number':
+      return `${phone} is not a working number`;
+    case 'failed':
+      return `The call to ${phone} failed`;
+    case 'no_answer':
+    default:
+      return `No answer from ${phone}`;
+  }
 }
 
 /** Synthetic leads for inbound calls from unknown numbers have ids starting with 'unknown:'. */

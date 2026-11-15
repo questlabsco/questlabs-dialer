@@ -331,3 +331,28 @@ describe('whole pipeline into the demo api', () => {
     expect(res2).toMatchObject({ imported: 0, duplicates: 2 });
   });
 });
+
+describe('map-scraper exports', () => {
+  it('reads "title" as the business name and never uses the category as a name', () => {
+    const a = analyzeSheet(
+      [
+        'title,categoryName,address,city,state,phone,website,totalScore,reviewsCount',
+        '"Ace Plumbing & Drain",Plumber,"4410 Maple Ave, Dallas, TX 75219",Dallas,Texas,(214) 555-0143,https://ace.example,4.8,212',
+        '"Lone Star Roofing",Roofing contractor,"900 Main St, Fort Worth, TX 76102",Fort Worth,Texas,+1 817-555-0190,,4.5,88',
+      ].join('\n'),
+    );
+    const rows = prepareRows(a.grid, a.hasHeader, a.columns, a.mappings);
+    expect(rows.map((r) => r.lead.businessName)).toEqual(['Ace Plumbing & Drain', 'Lone Star Roofing']);
+    expect(rows.map((r) => r.lead.phones[0])).toEqual(['+12145550143', '+18175550190']);
+    expect(rows[0]!.lead.notes).toContain('Plumber');
+  });
+
+  it('keeps "Title" as a job title in contact exports', () => {
+    const a = analyzeSheet(
+      ['First Name,Last Name,Title,Company,Mobile Phone', 'Dana,Cole,Owner,Cole Landscaping,+1 214-555-0188', 'Raj,Patel,Founder,Patel Auto Glass,(817) 555-0123'].join('\n'),
+    );
+    const rows = prepareRows(a.grid, a.hasHeader, a.columns, a.mappings);
+    expect(rows.map((r) => r.lead.businessName)).toEqual(['Cole Landscaping', 'Patel Auto Glass']);
+    expect(rows.map((r) => r.lead.contactName)).toEqual(['Dana Cole', 'Raj Patel']);
+  });
+});

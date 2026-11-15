@@ -7,6 +7,9 @@
  * - Each lead has up to 3 phones, tried in order; once all are used the lead gets a missed day.
  * - Voicemail is detected on the active call and skipped like a missed ring.
  * - Inbound calls (leads calling back) are offered to the caller between calls.
+ * - Manual calls (callNumber): one number typed by the caller, rung once while idle or paused. From
+ *   idle the audio session is opened for that call only; afterwards the dialer returns to where it
+ *   was. Known leads get a wrap-up (no queue lock, no missed day); other numbers do not.
  *
  * Every transition (control calls, telephony events, timers) runs through one promise queue, so
  * there are no interleaving races. Internal mutable bookkeeping (`slots`, `active`, `wrap`,
@@ -15,6 +18,7 @@
  * No React here; see `useDialer.ts`.
  */
 import { errorMessage, type Api } from '../api/Api';
+import { formatPhone, normalizePhone } from '../lib/format';
 import { DEFAULT_SETTINGS, type CallResult, type Lead, type PhoneNumber, type PresenceStatus, type Settings } from '../types';
 import type { EndReason, Telephony, TelephonyEvent } from '../telephony/Telephony';
 import {
@@ -47,6 +51,18 @@ export const CONVERSATION_MIN_SECONDS = 20;
 
 export const NO_CAPACITY_MESSAGE =
   'No outbound numbers have capacity left today. Ask your admin to add numbers or raise the daily caps.';
+
+export const MANUAL_INVALID_NUMBER_MESSAGE = 'Enter a 10-digit US number';
+export const MANUAL_WHILE_DIALING_MESSAGE = 'Pause dialing to call a number yourself';
+export const MANUAL_DURING_CALL_MESSAGE = 'Finish this call first';
+export const MANUAL_DURING_INCOMING_MESSAGE = 'Answer or decline the incoming call first';
+export const MANUAL_AFTER_ERROR_MESSAGE = 'Press Stop, then call the number';
+
+/** A US number in any common format -> +1XXXXXXXXXX, or null. */
+export function normalizeUsPhone(input: string): string | null {
+  const n = normalizePhone(input);
+  return n && /^\+1[2-9]\d{2}[2-9]\d{6}$/.test(n) ? n : null;
+}
 
 /** The next ring a lead on a line is waiting for. */
 interface NextRing {
@@ -86,9 +102,28 @@ interface Active {
   direction: 'outbound' | 'inbound';
   fromNumber: string;
   toNumber: string;
-  /** Slot index for outbound calls; null for inbound. */
+  /** Slot index for queue calls; null for inbound and manual calls. */
   lineIndex: number | null;
   muted: boolean;
+  /** Placed with callNumber. */
+  manual: boolean;
+}
+
+/** A manual call (callNumber) from dialing until its wrap-up (if any) is done. */
+interface Manual {
+  /** The session was opened for this call (we were idle): close it afterwards. Else back to paused. */
+  ownsSession: boolean;
+  lead: Lead;
+  /** Number is not a lead (`unknown:` lead, no wrap-up). */
+  synthetic: boolean;
+  phone: string;
+  fromNumber: string;
+  callId: string;
+  callRecordId: string;
+  startedAtMs: number;
+  /** ringing -> answered (this.active) -> done (ended; waiting for wrap-up or cleanup). */
+  status: 'ringing' | 'answered' | 'done';
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 interface Pending {
@@ -152,6 +187,7 @@ export class DialerEngine implements DialerControls {
   private active: Active | null = null;
   private wrap: WrapUp | null = null;
   private pending: Pending | null = null;
+  private manual: Manual | null = null;
   private stopRequested = false;
   /** Fatal error raised during a call; applied once the wrap-up is done. */
   private fatalAfterWrapUp: string | null = null;
@@ -240,6 +276,7 @@ export class DialerEngine implements DialerControls {
         ...INITIAL_DIALER_STATE,
         phase: 'starting',
         session: { ...INITIAL_DIALER_STATE.session, startedAt: this.iso() },
+        manualEnded: null,
       });
       try {
         this.settings = { ...DEFAULT_SETTINGS, ...(await this.api.getSettings()) };
@@ -263,6 +300,8 @@ export class DialerEngine implements DialerControls {
 
   pause(): Promise<void> {
     return this.control(async () => {
+      // A manual call returns to idle / paused by itself.
+      if (this.manual) return;
       const phase = this.state.phase;
       if (phase === 'connected' || phase === 'wrap_up') {
         this.commit({ pauseRequested: !this.state.pauseRequested });
@@ -289,6 +328,11 @@ export class DialerEngine implements DialerControls {
     return this.control(async () => {
       const phase = this.state.phase;
       if (phase === 'idle') return;
+      if (this.manual?.status === 'ringing') {
+        this.stopRequested = true;
+        await this.cancelManualRing();
+        return;
+      }
       if (this.active) {
         this.stopRequested = true;
         const a = this.active;
@@ -310,7 +354,11 @@ export class DialerEngine implements DialerControls {
   hangUp(): Promise<void> {
     return this.control(async () => {
       const a = this.active;
-      if (!a) return;
+      if (!a) {
+        // Cancel a manual call that is still ringing.
+        if (this.manual?.status === 'ringing') await this.cancelManualRing();
+        return;
+      }
       this.detach(a.callId);
       await this.hangupQuietly(a.callId);
       await this.endActive();
@@ -376,7 +424,7 @@ export class DialerEngine implements DialerControls {
   answerIncoming(): Promise<void> {
     return this.control(async () => {
       const p = this.pending;
-      if (!p || p.answering || this.active || this.wrap) return;
+      if (!p || p.answering || this.active || this.wrap || this.manual) return;
       const ids = await this.hangupLines();
       await this.release(ids);
       this.clearPoll();
@@ -410,6 +458,121 @@ export class DialerEngine implements DialerControls {
       await this.logMissedInbound(p);
       this.commit();
       await this.afterIncomingCleared();
+    });
+  }
+
+  callNumber(phone: string): Promise<void> {
+    return this.control(async () => {
+      const phase = this.state.phase;
+      if (this.manual || phase === 'connected' || phase === 'wrap_up') throw new Error(MANUAL_DURING_CALL_MESSAGE);
+      if (phase === 'dialing' || phase === 'starting') throw new Error(MANUAL_WHILE_DIALING_MESSAGE);
+      if (phase === 'error') throw new Error(MANUAL_AFTER_ERROR_MESSAGE);
+      if (this.pending) throw new Error(MANUAL_DURING_INCOMING_MESSAGE);
+      const to = normalizeUsPhone(phone);
+      if (!to) throw new Error(MANUAL_INVALID_NUMBER_MESSAGE);
+
+      // From idle the audio session is opened for this call only.
+      const ownsSession = phase === 'idle';
+      const fail = async (message: string): Promise<never> => {
+        if (ownsSession) {
+          await this.safe('disconnect', this.telephony.disconnect());
+          this.resetInternals();
+          this.presence('idle');
+          this.commit({ phase: 'idle', pauseRequested: false, queueEmpty: false, error: null });
+        }
+        throw new Error(message);
+      };
+
+      if (ownsSession) {
+        this.resetInternals();
+        this.commit({
+          ...INITIAL_DIALER_STATE,
+          phase: 'starting',
+          session: { ...INITIAL_DIALER_STATE.session, startedAt: this.iso() },
+          manualEnded: null,
+        });
+        try {
+          this.settings = { ...DEFAULT_SETTINGS, ...(await this.api.getSettings()) };
+        } catch (e) {
+          return fail(`Couldn't load settings: ${errorMessage(e)}`);
+        }
+        try {
+          await this.telephony.connect();
+        } catch (e) {
+          return fail(`Couldn't connect your audio: ${errorMessage(e)}`);
+        }
+        // One (never filled) line, so a running state always has lines, e.g. during the wrap-up.
+        this.slots = [emptySlot(0)];
+      } else if (this.state.manualEnded) {
+        this.commit({ manualEnded: null });
+      }
+
+      let num: PhoneNumber | null;
+      try {
+        num = await this.api.pickFromNumber(to);
+      } catch (e) {
+        return fail(`Couldn't pick an outbound number: ${errorMessage(e)}`);
+      }
+      if (!num) return fail(NO_CAPACITY_MESSAGE);
+      const from = num.number;
+
+      // Known leads are used as they are: not claimed or locked through the queue.
+      const found = (await this.safe('finding lead', this.api.findLeadByPhone(to))) ?? null;
+      const lead = found ?? this.syntheticLead(to);
+
+      let callId: string;
+      try {
+        callId = await this.telephony.dial({
+          to,
+          from,
+          leadId: lead.id,
+          ring: 1,
+          ringSeconds: this.settings.ringSeconds,
+          // Never auto-skip: someone testing with their own phone should hear their voicemail.
+          detectMachine: false,
+          record: this.settings.recordCalls,
+        });
+      } catch (e) {
+        return fail(`Couldn't place the call: ${errorMessage(e)}`);
+      }
+
+      const startedAtMs = this.now();
+      let recordId: string;
+      try {
+        const rec = await this.api.createCall({
+          leadId: found ? found.id : null,
+          direction: 'outbound',
+          fromNumber: from,
+          toNumber: to,
+          ring: 1,
+          startedAt: this.iso(startedAtMs),
+          providerCallId: callId,
+        });
+        recordId = rec.id;
+      } catch (e) {
+        await this.hangupQuietly(callId);
+        return fail(`Couldn't log the call: ${errorMessage(e)}`);
+      }
+
+      const m: Manual = {
+        ownsSession,
+        lead,
+        synthetic: !found,
+        phone: to,
+        fromNumber: from,
+        callId,
+        callRecordId: recordId,
+        startedAtMs,
+        status: 'ringing',
+        timer: null,
+      };
+      const ringMs = Math.max(1, this.settings.ringSeconds) * 1000 + RING_GRACE_MS;
+      m.timer = setTimeout(() => {
+        void this.run(() => this.onManualRingTimeout(callId)).catch((e) => warn('manual ring timeout', e));
+      }, ringMs);
+      this.manual = m;
+      this.presence('dialing');
+      this.commit({ phase: 'dialing', queueEmpty: false, session: this.bumpSession({ dials: this.state.session.dials + 1 }) });
     });
   }
 
@@ -452,6 +615,27 @@ export class DialerEngine implements DialerControls {
     };
   }
 
+  /** While a manual call rings or is answered it is the only line shown. */
+  private renderLines(): LineState[] {
+    const m = this.manual;
+    if (m && (m.status === 'ringing' || m.status === 'answered')) {
+      return [
+        {
+          index: 0,
+          status: m.status,
+          lead: m.lead,
+          phone: m.phone,
+          fromNumber: m.fromNumber,
+          ring: 1,
+          callId: m.callId,
+          startedAt: this.iso(m.startedAtMs),
+          manual: true,
+        },
+      ];
+    }
+    return this.slots.map((s) => this.renderLine(s));
+  }
+
   private renderActive(): ActiveCall | null {
     const a = this.active;
     if (!a) return null;
@@ -464,6 +648,7 @@ export class DialerEngine implements DialerControls {
       answeredAt: this.iso(a.answeredAtMs),
       muted: a.muted,
       direction: a.direction,
+      ...(a.manual ? { manual: true } : {}),
     };
   }
 
@@ -477,7 +662,7 @@ export class DialerEngine implements DialerControls {
     this.state = {
       ...this.state,
       ...patch,
-      lines: this.slots.map((s) => this.renderLine(s)),
+      lines: this.renderLines(),
       activeCall: this.renderActive(),
       wrapUp: this.wrap ? { ...this.wrap } : null,
       incoming: this.renderIncoming(),
@@ -502,6 +687,8 @@ export class DialerEngine implements DialerControls {
     this.active = null;
     this.wrap = null;
     this.pending = null;
+    if (this.manual?.timer) clearTimeout(this.manual.timer);
+    this.manual = null;
     this.stopRequested = false;
     this.fatalAfterWrapUp = null;
   }
@@ -568,6 +755,7 @@ export class DialerEngine implements DialerControls {
       !this.active &&
       !this.wrap &&
       !this.pending &&
+      !this.manual &&
       !this.state.pauseRequested &&
       !this.stopRequested &&
       !this.disposed
@@ -834,6 +1022,10 @@ export class DialerEngine implements DialerControls {
       if (p.answering) await this.connectInbound(p);
       return;
     }
+    if (this.manual && this.manual.callId === callId) {
+      if (this.manual.status === 'ringing') await this.onManualAnswered(this.manual);
+      return;
+    }
     if (this.droppedCalls.has(callId)) {
       // Picked up while we were already hanging up on them (another line won).
       const recordId = this.droppedCalls.get(callId) ?? null;
@@ -875,6 +1067,7 @@ export class DialerEngine implements DialerControls {
       toNumber: slot.phones[slot.phoneIdx] ?? '',
       lineIndex: slot.index,
       muted: false,
+      manual: false,
     };
     this.clearPoll();
     this.presence('on_call', slot.lead.businessName);
@@ -938,6 +1131,10 @@ export class DialerEngine implements DialerControls {
       await this.endActive();
       return;
     }
+    if (this.manual && this.manual.callId === callId) {
+      if (this.manual.status === 'ringing') await this.endManualRing(resultForEnd(reason), { hangup: false, report: true });
+      return;
+    }
     const slot = this.slotForCall(callId);
     if (!slot || slot.status !== 'ringing' || !slot.lead) return;
     const result = resultForEnd(reason);
@@ -953,7 +1150,7 @@ export class DialerEngine implements DialerControls {
 
   private async onIncoming(callId: string, from: string, to: string): Promise<void> {
     const phase = this.state.phase;
-    const canOffer = (phase === 'dialing' || phase === 'paused') && !this.active && !this.wrap && !this.pending;
+    const canOffer = (phase === 'dialing' || phase === 'paused') && !this.active && !this.wrap && !this.pending && !this.manual;
     const lead = (await this.safe('finding lead', this.api.findLeadByPhone(from))) ?? null;
     if (!canOffer) {
       await this.safe('decline incoming', this.telephony.declineIncoming(callId));
@@ -993,6 +1190,7 @@ export class DialerEngine implements DialerControls {
       toNumber: p.to,
       lineIndex: null,
       muted: false,
+      manual: false,
     };
     this.presence('on_call', lead.businessName);
     this.commit({ phase: 'connected', queueEmpty: false });
@@ -1053,6 +1251,87 @@ export class DialerEngine implements DialerControls {
   }
 
   // -------------------------------------------------------------------------
+  // Manual calls
+  // -------------------------------------------------------------------------
+
+  private async onManualAnswered(m: Manual): Promise<void> {
+    if (m.timer) clearTimeout(m.timer);
+    m.timer = null;
+    m.status = 'answered';
+    const answeredAtMs = this.now();
+    this.active = {
+      callId: m.callId,
+      callRecordId: m.callRecordId,
+      lead: m.lead,
+      synthetic: m.synthetic,
+      answeredAtMs,
+      direction: 'outbound',
+      fromNumber: m.fromNumber,
+      toNumber: m.phone,
+      lineIndex: null,
+      muted: false,
+      manual: true,
+    };
+    this.presence('on_call', m.synthetic ? formatPhone(m.phone) : m.lead.businessName);
+    this.commit({ phase: 'connected', queueEmpty: false, session: this.bumpSession({ pickups: this.state.session.pickups + 1 }) });
+    await this.unmuteForNewCall();
+    await this.safe('answered', this.api.updateCall(m.callRecordId, { answeredAt: this.iso(answeredAtMs), result: 'answered' }));
+  }
+
+  private async onManualRingTimeout(callId: string): Promise<void> {
+    const m = this.manual;
+    if (!m || m.callId !== callId || m.status !== 'ringing') return;
+    await this.endManualRing('no_answer', { hangup: true, report: true });
+  }
+
+  /** We hang up a manual call that is still ringing (Hang up / Cancel). */
+  private async cancelManualRing(): Promise<void> {
+    await this.endManualRing('no_answer', { hangup: true, report: false });
+  }
+
+  /**
+   * A manual call ended without anyone connected. Logged like any ring, but no missed day, no bad
+   * number report and no wrap-up; then back to idle / paused.
+   */
+  private async endManualRing(result: CallResult, opts: { hangup: boolean; report: boolean }): Promise<void> {
+    const m = this.manual;
+    if (!m || m.status !== 'ringing') return;
+    if (m.timer) clearTimeout(m.timer);
+    m.timer = null;
+    // Mark first so the `ended` event our own hangup causes is ignored.
+    m.status = 'done';
+    if (opts.hangup) await this.hangupQuietly(m.callId);
+    const endedAt = this.iso();
+    await this.safe('manual call ended', this.api.updateCall(m.callRecordId, { endedAt, result }));
+    this.commit({ manualEnded: opts.report ? { phone: m.phone, result, endedAt } : null });
+    await this.finishManual();
+  }
+
+  /** The manual call (and its wrap-up, if any) is over: stop, fail, close the session or re-pause. */
+  private async finishManual(): Promise<void> {
+    const m = this.manual;
+    if (!m) return;
+    if (m.timer) clearTimeout(m.timer);
+    this.manual = null;
+    if (this.stopRequested) {
+      await this.finalStop();
+      return;
+    }
+    if (this.fatalAfterWrapUp) {
+      const msg = this.fatalAfterWrapUp;
+      this.fatalAfterWrapUp = null;
+      await this.enterFatal(msg);
+      return;
+    }
+    if (m.ownsSession) {
+      await this.finalStop();
+      return;
+    }
+    this.presence('paused');
+    this.commit({ phase: 'paused', pauseRequested: false, queueEmpty: false });
+  }
+
+  // -------------------------------------------------------------------------
   // Call end, wrap-up, pause, stop, errors
   // -------------------------------------------------------------------------
 
@@ -1062,6 +1341,7 @@ export class DialerEngine implements DialerControls {
     if (!a) return;
     this.active = null;
     this.detach(a.callId);
+    if (a.manual && this.manual && this.manual.callId === a.callId) this.manual.status = 'done';
     const endMs = this.now();
     const talkSeconds = Math.max(0, Math.round((endMs - a.answeredAtMs) / 1000));
     if (a.lineIndex !== null) {
@@ -1081,13 +1361,17 @@ export class DialerEngine implements DialerControls {
       await this.afterCallDone();
       return;
     }
-    this.wrap = { lead: a.lead, callRecordId: a.callRecordId, talkSeconds };
+    this.wrap = { lead: a.lead, callRecordId: a.callRecordId, talkSeconds, ...(a.manual ? { manual: true } : {}) };
     this.presence('wrap_up', a.lead.businessName);
     this.commit({ phase: 'wrap_up', session });
   }
 
   /** After a wrap-up (or a call that needs none): stop, fail, pause or keep dialing. */
   private async afterCallDone(): Promise<void> {
+    if (this.manual) {
+      await this.finishManual();
+      return;
+    }
     if (this.stopRequested) {
       await this.finalStop();
       return;
@@ -1118,6 +1402,14 @@ export class DialerEngine implements DialerControls {
   /** Hang up / release everything this engine holds except the active call and wrap-up. */
   private async cleanupAll(): Promise<void> {
     this.clearPoll();
+    const m = this.manual;
+    if (m && m.status === 'ringing') {
+      if (m.timer) clearTimeout(m.timer);
+      m.timer = null;
+      m.status = 'done';
+      await this.hangupQuietly(m.callId);
+      await this.safe('cancelling manual call', this.api.updateCall(m.callRecordId, { endedAt: this.iso(), result: 'no_answer' }));
+    }
     const ids = await this.hangupLines();
     for (const s of this.slots) if (s.lead && s.status === 'answered' && !this.active) {
       ids.push(s.lead.id);

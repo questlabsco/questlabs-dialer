@@ -26,6 +26,12 @@ export const FIXTURE_NAMES = [
   'wrap_up_unknown',
   'paused',
   'error',
+  'idle_manual_ended',
+  'manual_ringing',
+  'manual_ringing_lead',
+  'manual_connected',
+  'manual_connected_lead',
+  'manual_wrap_up',
 ] as const;
 
 export type FixtureName = (typeof FIXTURE_NAMES)[number];
@@ -225,6 +231,38 @@ export function buildFixtures(now: number = Date.now()): Record<FixtureName, Dia
     ...patch,
   });
 
+  // Manual calls (callNumber): one line, rung once.
+  const manualTo = '+14695550123';
+  const manualLine = (l: Lead, phone: string, status: 'ringing' | 'answered', secondsAgo: number): LineState => ({
+    index: 0,
+    status,
+    lead: l,
+    phone,
+    fromNumber: '+14695559003',
+    ring: 1,
+    callId: `fx-manual-${l.id}`,
+    startedAt: iso(now, -secondsAgo),
+    manual: true,
+  });
+  const manualSession = session(30, { dials: 1, pickups: 0, conversations: 0, bookings: 0, talkSeconds: 0 });
+  const manualConnected = (l: Lead, phone: string): DialerState => ({
+    ...base,
+    phase: 'connected',
+    lines: [manualLine(l, phone, 'answered', 50)],
+    activeCall: {
+      lead: l,
+      callId: `fx-manual-${l.id}`,
+      callRecordId: `fx-rec-manual-${l.id}`,
+      fromNumber: '+14695559003',
+      toNumber: phone,
+      answeredAt: iso(now, -42),
+      muted: false,
+      direction: 'outbound',
+      manual: true,
+    },
+    session: { ...manualSession, pickups: 1 },
+  });
+
   const f = (name: FixtureName, description: string, state: DialerState, extra: Partial<DialerFixture> = {}): DialerFixture => ({
     name,
     description,
@@ -288,5 +326,24 @@ export function buildFixtures(now: number = Date.now()): Record<FixtureName, Dia
       error: 'Could not connect to the phone service. Check your internet connection and try again.',
       session: session(200, { dials: 3, pickups: 0, conversations: 0, bookings: 0, talkSeconds: 0 }),
     }),
+    idle_manual_ended: f('idle_manual_ended', 'Idle after a manual call that was not answered', {
+      ...base,
+      manualEnded: { phone: manualTo, result: 'no_answer', endedAt: iso(now, -5) },
+    }),
+    manual_ringing: f('manual_ringing', 'Manual call to a number that is not a lead, ringing', {
+      ...base,
+      phase: 'dialing',
+      lines: [manualLine(unknown, manualTo, 'ringing', 7)],
+      session: manualSession,
+    }),
+    manual_ringing_lead: f('manual_ringing_lead', 'Manual call to a known lead, ringing', {
+      ...base,
+      phase: 'dialing',
+      lines: [manualLine(lonestar, lonestar.phones[0], 'ringing', 4)],
+      session: manualSession,
+    }),
+    manual_connected: f('manual_connected', 'Manual call answered (number not in leads)', manualConnected(unknown, manualTo)),
+    manual_connected_lead: f('manual_connected_lead', 'Manual call answered by a known lead', manualConnected(acme, acme.phones[0])),
+    manual_wrap_up: f('manual_wrap_up', 'Wrap-up after a manual call to a known lead', wrapState(acme, { wrapUp: { lead: acme, callRecordId: `fx-rec-manual-${acme.id}`, talkSeconds: 96, manual: true }, lines: [emptyLine(0)] })),
   };
 }

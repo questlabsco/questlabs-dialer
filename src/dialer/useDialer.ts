@@ -43,6 +43,7 @@ export function useDialer(): { state: DialerState; controls: DialerControls } {
       submitDisposition: (input) => e.submitDisposition(input),
       answerIncoming: () => e.answerIncoming(),
       declineIncoming: () => e.declineIncoming(),
+      callNumber: (phone) => e.callNumber(phone),
     }),
     [e],
   );
