@@ -1,8 +1,8 @@
 // telnyx-dial: places one outbound lead call and returns { callId } at once (our own uuid).
 // Body: { to, from, leadId, ring, ringSeconds?, detectMachine?, record? } (Telephony.DialRequest).
-// The Dial command links the lead leg to the caller's parked agent leg with bridge_on_answer +
-// prevent_double_bridge, so the lead is connected the instant they pick up without waiting for our
-// webhook, and a second pickup can never double-bridge. Events arrive via telnyx-webhook.
+// The lead leg is joined to the caller's agent leg by telnyx-webhook when the lead picks up (a
+// Bridge from the agent leg that parks it again afterwards); a second pickup is settled there too.
+// Events arrive via telnyx-webhook.
 import { buildDialBody, isUsE164 } from '../_shared/telnyxLogic.ts';
 import {
   adminClient,
@@ -83,11 +83,11 @@ serve(async (req) => {
   const dialBody = buildDialBody({
     callId,
     voiceAppId: cfg.voice_app_id,
-    agentCallControlId: agent.call_control_id,
     to: body.to,
     from: body.from,
     ringSeconds: typeof body.ringSeconds === 'number' ? body.ringSeconds : settings.ring_seconds,
     detectMachine,
+    screeningIntro: detectMachine && settings.screening_intro !== '',
     record,
   });
 

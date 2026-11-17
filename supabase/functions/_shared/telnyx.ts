@@ -247,6 +247,8 @@ export interface DialSettings {
   skip_voicemail: boolean;
   record_calls: boolean;
   default_daily_cap: number;
+  /** Said to iPhone call screeners ('{name}' = the caller's first name); empty = hang up on them. */
+  screening_intro: string;
 }
 
 export async function loadSettings(): Promise<DialSettings> {
@@ -259,6 +261,7 @@ export async function loadSettings(): Promise<DialSettings> {
     skip_voicemail: typeof s.skip_voicemail === 'boolean' ? s.skip_voicemail : true,
     record_calls: typeof s.record_calls === 'boolean' ? s.record_calls : false,
     default_daily_cap: num(s.default_daily_cap, 100),
+    screening_intro: typeof s.screening_intro === 'string' ? s.screening_intro.trim() : '',
   };
 }
 

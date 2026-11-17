@@ -7,7 +7,11 @@
 // Authentication is the Telnyx signature: Ed25519 over `${telnyx-timestamp}|${raw body}`.
 import {
   AGENT_LEG_DESTINATION,
+  agentBridgeBody,
   agentSessionIdOf,
+  amdOutcome,
+  screeningIntroSpeakBody,
+  screeningIntroText,
   base64ToBytes,
   encodeClientState,
   hangupToEndReason,
@@ -222,28 +226,10 @@ async function handleOutbound(w: ParsedWebhook, row: CallRow): Promise<void> {
       if (data?.length && callerId) await emitEvent({ callerId, callId: row.id, type: 'ringing' });
       return;
     }
-    case 'answered': {
-      const { data } = await db
-        .from('telephony_calls')
-        .update({ status: 'answered', answered_at: w.occurredAt ?? new Date().toISOString() })
-        .eq('id', row.id)
-        .in('status', ['dialing', 'ringing'])
-        .select('id');
-      if (data?.length && callerId) await emitEvent({ callerId, callId: row.id, type: 'answered' });
-      return;
-    }
-    case 'machine': {
-      if (!w.isMachine) return;
-      const { data } = await db
-        .from('telephony_calls')
-        .update({ machine: true })
-        .eq('id', row.id)
-        .eq('status', 'answered')
-        .eq('machine', false)
-        .select('id');
-      if (data?.length && callerId) await emitEvent({ callerId, callId: row.id, type: 'machine' });
-      return;
-    }
+    case 'answered':
+      return answerOutbound(w, row);
+    case 'machine':
+      return onMachineEvent(w, row);
     case 'hangup':
       return endCall(w, row);
     case 'recording_saved':
@@ -251,6 +237,80 @@ async function handleOutbound(w: ParsedWebhook, row: CallRow): Promise<void> {
     default:
       return;
   }
+}
+
+/**
+ * A lead picked up. telephony_answer_outbound marks the call answered, decides (under a lock on the
+ * agent session) whether this pickup gets the caller, and writes the `answered` event. The winner
+ * is bridged from the agent leg, which is parked again when the lead's call ends; a second pickup
+ * or a pickup with no open audio line is hung up.
+ */
+async function answerOutbound(w: ParsedWebhook, row: CallRow): Promise<void> {
+  const db = adminClient();
+  const { data, error } = await db.rpc('telephony_answer_outbound', {
+    p_call: row.id,
+    p_at: w.occurredAt ?? new Date().toISOString(),
+  });
+  if (error) throw new Error(`answer_outbound: ${error.message}`);
+  const res = (data ?? {}) as { result?: string; agent_call_control_id?: string | null };
+  const leadCcid = w.callControlId ?? row.call_control_id;
+  if (res.result === 'stale' || !leadCcid) return;
+
+  const dropLead = async (reason: 'hangup_local' | 'failed') => {
+    await db.from('telephony_calls').update({ local_end_reason: reason }).eq('id', row.id).is('local_end_reason', null);
+    await callCommand(leadCcid, 'hangup', { command_id: `drop-${row.id}` });
+  };
+
+  if (res.result === 'won' && res.agent_call_control_id) {
+    try {
+      await callCommand(res.agent_call_control_id, 'bridge', agentBridgeBody(leadCcid, row.id), false);
+    } catch (e) {
+      console.error('bridge to the agent leg failed:', e instanceof Error ? e.message : String(e));
+      await dropLead('failed');
+    }
+    return;
+  }
+  // 'lost' (another line already has the caller; the app also hangs up on it) or 'no_agent'.
+  await dropLead(res.result === 'lost' ? 'hangup_local' : 'failed');
+}
+
+/**
+ * Answering-machine detection on an answered lead call. Voicemail -> `machine` event (the app hangs
+ * up). With a screening intro set, a first "machine" result is only a suspicion: iPhone call
+ * screening also answers as a machine, so we wait for the greeting to end. If it was a screener, the
+ * intro is spoken to it and the call stays up so the person can pick up; a voicemail beep (or no
+ * beep) still hangs up.
+ */
+async function onMachineEvent(w: ParsedWebhook, row: CallRow): Promise<void> {
+  const outcome = amdOutcome(w.eventType, w.machineResult);
+  if (!outcome || row.status !== 'answered') return;
+  const db = adminClient();
+  const settings = await loadSettings();
+  const intro = settings.screening_intro;
+
+  if (outcome === 'suspect' && intro) {
+    await db.from('telephony_calls').update({ machine: true }).eq('id', row.id);
+    return;
+  }
+  if (outcome === 'screening') {
+    const ccid = w.callControlId ?? row.call_control_id;
+    if (!intro || !ccid) return;
+    const { data: who } = row.caller_id
+      ? await db.from('profiles').select('full_name').eq('id', row.caller_id).maybeSingle()
+      : { data: null };
+    const text = screeningIntroText(intro, (who?.full_name as string | null) ?? null);
+    if (!text) return;
+    try {
+      await callCommand(ccid, 'speak', screeningIntroSpeakBody(text, row.id));
+    } catch (e) {
+      console.error('screening intro failed, trying the standard voice:', e instanceof Error ? e.message : String(e));
+      await callCommand(ccid, 'speak', screeningIntroSpeakBody(text, row.id, true)).catch(() => false);
+    }
+    return;
+  }
+  // Voicemail (or a machine with no intro set): tell the app once; it hangs up.
+  await db.from('telephony_calls').update({ machine: true }).eq('id', row.id);
+  if (row.caller_id) await emitEvent({ callerId: row.caller_id, callId: row.id, type: 'machine' });
 }
 
 async function endCall(w: ParsedWebhook, row: CallRow): Promise<void> {

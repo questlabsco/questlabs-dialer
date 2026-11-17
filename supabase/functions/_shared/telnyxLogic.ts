@@ -440,6 +440,57 @@ export function hangupToEndReason(ctx: HangupContext): EndReason {
 
 /** AMD mode requested on Dial when detection is wanted. */
 export const AMD_MODE = 'premium' as const;
+/** AMD mode that also recognises iPhone call screening (used when a screening intro is set). */
+export const AMD_MODE_SCREENING = 'premium_ios_call_screening_detection' as const;
+
+/**
+ * What an AMD webhook means for an outbound call:
+ * - 'voicemail': hang up (skip voicemail);
+ * - 'suspect': a machine answered, but it may still turn out to be iPhone call screening; with a
+ *   screening intro set we wait for the greeting to end before deciding (without one it is voicemail);
+ * - 'screening': the screener's prompt is over: answer it with the intro and keep the call up;
+ * - null: a person, or nothing to act on.
+ * Telnyx sequences: screening = detection.ended machine, then greeting.ended prompt_ended and/or
+ * call_screening.detected (detection restarts afterwards); voicemail = detection.ended machine, then
+ * greeting.ended beep_detected | no_beep_detected; person = detection.ended human_*.
+ */
+export function amdOutcome(eventType: string, result: unknown): 'voicemail' | 'suspect' | 'screening' | null {
+  switch (eventType) {
+    case 'call.machine.detection.ended':
+      return result === 'machine' ? 'voicemail' : null;
+    case 'call.machine.premium.detection.ended':
+      if (result === 'fax_detected') return 'voicemail';
+      return result === 'machine' ? 'suspect' : null;
+    case 'call.machine.premium.greeting.ended':
+      if (result === 'prompt_ended') return 'screening';
+      return result === 'beep_detected' || result === 'no_beep_detected' ? 'voicemail' : null;
+    case 'call.machine.premium.call_screening.detected':
+      return result === 'screening' ? 'screening' : null;
+    default:
+      return null;
+  }
+}
+
+export const SCREENING_INTRO_VOICE = MISSED_CALLBACK_SPEECH.voice;
+
+/** The intro with `{name}` replaced by the caller's first name (or removed when unknown). */
+export function screeningIntroText(template: string, callerFullName: string | null | undefined): string {
+  const first = (callerFullName ?? '').trim().split(/\s+/)[0] ?? '';
+  const text = first ? template.replace(/\{name\}/gi, first) : template.replace(/\{name\}\s+(with|from)\s+/gi, '').replace(/\{name\}/gi, '');
+  return text.replace(/\s{2,}/g, ' ').trim();
+}
+
+/** Body for the Speak command that answers a call screener on the lead's leg. */
+export function screeningIntroSpeakBody(text: string, callId: string, useFallbackVoice = false): Record<string, unknown> {
+  return {
+    payload: text,
+    payload_type: 'text',
+    voice: useFallbackVoice ? MISSED_CALLBACK_SPEECH.fallbackVoice : SCREENING_INTRO_VOICE,
+    language: MISSED_CALLBACK_SPEECH.language,
+    client_state: encodeClientState({ v: 1, k: 'out', id: callId }),
+    command_id: `intro-${callId}${useFallbackVoice ? '-b' : ''}`,
+  };
+}
 
 /**
  * True when an AMD webhook means "not a human". Standard: call.machine.detection.ended result
@@ -623,11 +674,12 @@ export function parseRecordingRef(url: unknown): string | null {
 export interface DialBodyInput {
   callId: string;
   voiceAppId: string;
-  agentCallControlId: string;
   to: string;
   from: string;
   ringSeconds: number;
   detectMachine: boolean;
+  /** Also detect iPhone call screening (a screening intro is set). */
+  screeningIntro?: boolean;
   record: boolean;
 }
 
@@ -636,17 +688,16 @@ export function clampRingSeconds(s: unknown, fallback: number): number {
   return Math.min(600, Math.max(5, n));
 }
 
-/** Body for POST /v2/calls (Dial). */
+/**
+ * Body for POST /v2/calls (Dial). The lead leg is NOT linked or auto-bridged to the agent leg:
+ * with link_to + bridge_on_answer Telnyx hung up the agent leg whenever the lead's call ended.
+ * telnyx-webhook joins them on call.answered with agentBridgeBody instead.
+ */
 export function buildDialBody(i: DialBodyInput): Record<string, unknown> {
   const body: Record<string, unknown> = {
     connection_id: i.voiceAppId,
     to: i.to,
     from: i.from,
-    // Share the agent leg's session and bridge the instant the lead answers, without our webhook.
-    link_to: i.agentCallControlId,
-    bridge_on_answer: true,
-    // A second pickup while the agent is already bridged is hung up instead of double-bridged.
-    prevent_double_bridge: true,
     timeout_secs: clampRingSeconds(i.ringSeconds, 22),
     // With retry_on_timeout=false Telnyx does not try other routes after timeout_secs (cause no_answer).
     retry_on_timeout: false,
@@ -655,7 +706,7 @@ export function buildDialBody(i: DialBodyInput): Record<string, unknown> {
     command_id: i.callId,
   };
   if (i.detectMachine) {
-    body.answering_machine_detection = AMD_MODE;
+    body.answering_machine_detection = i.screeningIntro ? AMD_MODE_SCREENING : AMD_MODE;
   }
   if (i.record) {
     body.record = 'record-from-answer';
@@ -664,6 +715,19 @@ export function buildDialBody(i: DialBodyInput): Record<string, unknown> {
     body.record_trim = 'trim-silence';
   }
   return body;
+}
+
+/**
+ * Body for the Bridge command sent FROM the caller's agent leg TO an answered lead leg.
+ * park_after_unbridge = 'self' parks the agent leg (instead of hanging it up) when the lead's call
+ * ends, so the caller's audio line stays open for the next call.
+ */
+export function agentBridgeBody(leadCallControlId: string, callId: string): Record<string, unknown> {
+  return {
+    call_control_id: leadCallControlId,
+    park_after_unbridge: 'self',
+    command_id: `bridge-${callId}`,
+  };
 }
 
 // ---------------------------------------------------------------------------

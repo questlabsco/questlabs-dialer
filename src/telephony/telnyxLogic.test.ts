@@ -3,7 +3,11 @@ import {
   agentSessionIdOf,
   AGENT_SESSION_HEADER,
   base64ToBytes,
+  agentBridgeBody,
+  amdOutcome,
   buildDialBody,
+  screeningIntroSpeakBody,
+  screeningIntroText,
   buildRingBody,
   derivedId,
   INBOUND_FIRST_OFFER_SECONDS,
@@ -356,7 +360,6 @@ describe('buildDialBody', () => {
   const input = {
     callId: ID,
     voiceAppId: 'app-1',
-    agentCallControlId: 'v3:agent',
     to: '+12145550002',
     from: '+12145550001',
     ringSeconds: 22,
@@ -364,15 +367,12 @@ describe('buildDialBody', () => {
     record: true,
   };
 
-  it('links to the agent leg with instant bridge and no double bridge', () => {
+  it('dials the lead without linking or auto-bridging (that hung up the agent leg after each call)', () => {
     const b = buildDialBody(input);
     expect(b).toMatchObject({
       connection_id: 'app-1',
       to: '+12145550002',
       from: '+12145550001',
-      link_to: 'v3:agent',
-      bridge_on_answer: true,
-      prevent_double_bridge: true,
       timeout_secs: 22,
       retry_on_timeout: false,
       command_id: ID,
@@ -384,6 +384,22 @@ describe('buildDialBody', () => {
     expect(decodeClientState(b.client_state)).toEqual({ v: 1, k: 'out', id: ID });
     // bridge_intent would overwrite `from` with the agent leg's from: never sent.
     expect(b).not.toHaveProperty('bridge_intent');
+    expect(b).not.toHaveProperty('link_to');
+    expect(b).not.toHaveProperty('bridge_on_answer');
+    expect(b).not.toHaveProperty('park_after_unbridge');
+  });
+
+  it('uses the call-screening detection mode only when a screening intro is set', () => {
+    expect(buildDialBody({ ...input, screeningIntro: true }).answering_machine_detection).toBe('premium_ios_call_screening_detection');
+    expect(buildDialBody({ ...input, screeningIntro: false }).answering_machine_detection).toBe('premium');
+  });
+
+  it('agent bridge: issued from the agent leg, which is parked (not hung up) when the lead leaves', () => {
+    expect(agentBridgeBody('v3:lead', ID)).toEqual({
+      call_control_id: 'v3:lead',
+      park_after_unbridge: 'self',
+      command_id: `bridge-${ID}`,
+    });
   });
 
   it('omits AMD and recording when not requested', () => {
@@ -398,6 +414,37 @@ describe('buildDialBody', () => {
     expect(clampRingSeconds(undefined, 22)).toBe(22);
     expect(clampRingSeconds(Number.NaN, 30)).toBe(30);
     expect(clampRingSeconds(21.6, 22)).toBe(22);
+  });
+});
+
+describe('call screening', () => {
+  it('tells voicemail, a possible screener, a finished screening prompt and a person apart', () => {
+    expect(amdOutcome('call.machine.premium.detection.ended', 'machine')).toBe('suspect');
+    expect(amdOutcome('call.machine.premium.detection.ended', 'fax_detected')).toBe('voicemail');
+    expect(amdOutcome('call.machine.premium.detection.ended', 'human_residence')).toBeNull();
+    expect(amdOutcome('call.machine.premium.detection.ended', 'human_business')).toBeNull();
+    expect(amdOutcome('call.machine.premium.greeting.ended', 'prompt_ended')).toBe('screening');
+    expect(amdOutcome('call.machine.premium.greeting.ended', 'beep_detected')).toBe('voicemail');
+    expect(amdOutcome('call.machine.premium.greeting.ended', 'no_beep_detected')).toBe('voicemail');
+    expect(amdOutcome('call.machine.premium.call_screening.detected', 'screening')).toBe('screening');
+    expect(amdOutcome('call.machine.detection.ended', 'machine')).toBe('voicemail');
+    expect(amdOutcome('call.machine.premium.detection.started', undefined)).toBeNull();
+  });
+
+  it('fills in the caller first name, or drops it cleanly when unknown', () => {
+    const t = 'Hi, this is {name} with Quest Labs, calling for the business owner.';
+    expect(screeningIntroText(t, 'Mahavir Sopppannavar')).toBe('Hi, this is Mahavir with Quest Labs, calling for the business owner.');
+    expect(screeningIntroText(t, null)).toBe('Hi, this is Quest Labs, calling for the business owner.');
+    expect(screeningIntroText('Calling for the owner.', 'Sam')).toBe('Calling for the owner.');
+    const li = 'Hi, this is {name}. Saw your LinkedIn post, interested in connecting.';
+    expect(screeningIntroText(li, 'Mahavir Sopppannavar')).toBe('Hi, this is Mahavir. Saw your LinkedIn post, interested in connecting.');
+  });
+
+  it('speaks once per call on the lead leg, with a fallback voice', () => {
+    const b = screeningIntroSpeakBody('Hello', ID);
+    expect(b).toMatchObject({ payload: 'Hello', payload_type: 'text', voice: 'Azure.en-US-Ava:DragonHDLatestNeural', command_id: `intro-${ID}` });
+    expect(decodeClientState(b.client_state)).toEqual({ v: 1, k: 'out', id: ID });
+    expect(screeningIntroSpeakBody('Hello', ID, true)).toMatchObject({ voice: 'AWS.Polly.Joanna-Neural', command_id: `intro-${ID}-b` });
   });
 });
 
