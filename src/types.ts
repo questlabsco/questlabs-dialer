@@ -69,6 +69,7 @@ export function leadStatusLabel(status: LeadStatus): string {
 }
 
 export interface Lead {
+  attemptPlan?: Record<string, { ring: number; from: string | null }>;
   id: string;
   /** The LeadList this lead was imported into. */
   listId: string;

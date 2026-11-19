@@ -250,7 +250,7 @@ export default function Settings() {
           </div>
           <div className="set-toggles">
             {toggle('doubleRing', 'Ring twice', 'If nobody picks up, call the same number again right away. People often answer the second call.')}
-            {toggle('skipVoicemail', 'Skip voicemails', 'Hang up automatically when an answering machine picks up, so callers only talk to people.')}
+            {toggle('skipVoicemail', 'Detect voicemail', 'Check who answered before connecting the caller. A saved voicemail message plays after the beep on the final attempt.')}
             {toggle('recordCalls', 'Record calls', 'Save a recording of every answered call to listen to under Recordings. Check your local rules on telling people calls are recorded.')}
           </div>
         </section>

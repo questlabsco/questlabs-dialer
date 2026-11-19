@@ -142,6 +142,28 @@ afterEach(() => {
 });
 
 describe('dialer engine: starting', () => {
+  it('keeps the other line available during screening and connects its human pickup', async () => {
+    const t=await setup({leads:leadRows(2)});
+    await t.engine.start();
+    const [screened,human]=t.tel.dials;
+    await t.emit({type:'checking',callId:screened.callId});
+    await t.emit({type:'screening',callId:screened.callId});
+    expect(t.engine.getState().activeCall).toBeNull();
+    expect(t.tel.hangups).toEqual([]);
+    await t.emit({type:'answered',callId:human.callId});
+    expect(t.engine.getState().activeCall?.lead.id).toBe(human.leadId);
+  });
+
+  it('counts a terminal voicemail as a miss and retries once', async () => {
+    const t=await setup({leads:leadRows(1)});
+    await t.engine.start();
+    await t.emit({type:'ended',reason:'voicemail',callId:t.tel.lastDial().callId});
+    expect(t.tel.lastDial().ring).toBe(2);
+    await t.emit({type:'ended',reason:'voicemail',callId:t.tel.lastDial().callId});
+    expect(t.tel.dials).toHaveLength(2);
+    expect(t.engine.getState().session.pickups).toBe(0);
+  });
+
   it('connects, sets lines and rings two leads at once', async () => {
     const t = await setup({ leads: leadRows(3) });
     await t.engine.start();
@@ -776,7 +798,7 @@ describe('dialer engine: manual calls', () => {
     expect(t.tel.connected).toBe(true);
     expect(t.tel.dials).toHaveLength(1);
     const d = t.tel.dials[0];
-    expect(d).toMatchObject({ to: '+19725550199', ring: 1, detectMachine: false, record: true, ringSeconds: 22, leadId: 'unknown:+19725550199' });
+    expect(d).toMatchObject({ to: '+19725550199', ring: 1, detectMachine: true, record: true, ringSeconds: 22, leadId: 'unknown:+19725550199' });
     expect(s.phase).toBe('dialing');
     expect(s.lines).toHaveLength(1);
     expect(s.lines[0]).toMatchObject({ status: 'ringing', manual: true, phone: '+19725550199', fromNumber: d.from, callId: d.callId, ring: 1 });
@@ -861,7 +883,7 @@ describe('dialer engine: manual calls', () => {
     const lead = t.lead('Biz 0');
     await t.engine.callNumber(lead.phones[0]);
     const d = t.tel.lastDial();
-    expect(d).toMatchObject({ ringSeconds: 20, record: false, detectMachine: false });
+    expect(d).toMatchObject({ ringSeconds: 20, record: false, detectMachine: true });
     await vi.advanceTimersByTimeAsync(20_000 + RING_GRACE_MS);
     await t.settle();
     const s = t.engine.getState();

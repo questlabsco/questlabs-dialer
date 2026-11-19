@@ -77,6 +77,13 @@ function UpdateReady({ version, busy }: { version: string; busy: boolean }) {
   );
 }
 
+function CallerNavigation({onCall}:{onCall:()=>void}) {
+  const {state}=useDialer();
+  const id=state.activeCall?.callId ?? state.incoming?.callId;
+  useEffect(()=>{if(id) onCall();},[id,onCall]);
+  return null;
+}
+
 /** Light sidebar (workspace, role-based navigation, demo tag, user) + the active screen. Rendered only when signed in. */
 export function AppShell() {
   const { profile, isDemo, signOut } = useAuth();
@@ -103,6 +110,7 @@ export function AppShell() {
     [items],
   );
 
+  const showDialer=useCallback(()=>setScreen('dialer'),[]);
   const nav = useMemo<NavigationValue>(() => ({ screen, params, navigate }), [screen, params, navigate]);
   const allowed = items.some((i) => i.key === screen) ? screen : defaultScreen(role);
   const Screen = SCREENS[allowed];
@@ -121,6 +129,7 @@ export function AppShell() {
 
   return (
     <NavigationContext.Provider value={nav}>
+      {role==='caller' && <CallerNavigation onCall={showDialer}/>}
       <div className="app-shell">
         <aside className="sidebar">
           <div className="sb-workspace" title={`Quest Labs Dialer, version ${appVersion}`}>

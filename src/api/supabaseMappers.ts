@@ -103,6 +103,7 @@ export function leadFromRow(r: Row): Lead {
     businessName: str(r.business_name),
     contactName: str(r.contact_name),
     phones: strArray(r.phones),
+    ...(r.attempt_plan ? { attemptPlan: r.attempt_plan as Lead['attemptPlan'] } : {}),
     email: str(r.email),
     city: str(r.city),
     state: str(r.state),

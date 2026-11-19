@@ -23,6 +23,7 @@ export type DialerPhase =
 export interface LineState {
   /** 0-based line slot (0..linesPerCaller-1). */
   index: number;
+  detection?: 'checking' | 'screening' | 'voicemail';
   status: 'empty' | 'ringing' | 'answered';
   lead: Lead | null;
   /** Lead phone being rung (E.164), '' when empty. */

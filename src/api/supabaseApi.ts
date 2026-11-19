@@ -566,7 +566,7 @@ export class SupabaseApi implements Api {
     await this.caller();
     const n = Math.max(0, Math.min(10, Math.floor(count)));
     if (n === 0) return [];
-    return this.rows(await this.rpc('claim_next_leads', { p_count: n })).map(leadFromRow);
+    return this.rows(await this.rpc('claim_dial_batch', { p_count: n })).map(leadFromRow);
   }
 
   async releaseLeads(ids: string[]): Promise<void> {

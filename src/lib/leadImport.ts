@@ -781,11 +781,11 @@ export function prepareRows(grid: string[][], hasHeader: boolean, columns: Sourc
       status = 'invalid';
       reason = 'No business or contact name';
     } else {
-      const earlier = seen.get(usedPhones[0]);
+      const earlier = usedPhones.map(p=>seen.get(p)).find(n=>n!==undefined);
       if (earlier !== undefined) {
         status = 'duplicate';
         reason = `Same phone as row ${earlier}`;
-      } else seen.set(usedPhones[0], rowNumber);
+      } else usedPhones.forEach(p=>seen.set(p,rowNumber));
     }
     return { rowNumber, status, reason, lead, rejectedPhones: rejected.map((x) => x.value), raw: r };
   });
@@ -794,7 +794,7 @@ export function prepareRows(grid: string[][], hasHeader: boolean, columns: Sourc
 /** Mark ready rows whose primary phone already belongs to a lead in the system. */
 export function markExisting(rows: PreparedRow[], existingPrimaryPhones: ReadonlySet<string>): PreparedRow[] {
   return rows.map((r) =>
-    r.status === 'ready' && existingPrimaryPhones.has(r.lead.phones[0]) ? { ...r, status: 'existing' as RowStatus, reason: 'Already in the system (same phone)' } : r,
+    r.status === 'ready' && r.lead.phones.some(p=>existingPrimaryPhones.has(p)) ? { ...r, status: 'existing' as RowStatus, reason: 'Already in the system (same phone)' } : r,
   );
 }
 

@@ -90,6 +90,7 @@ interface PlacedRing {
 }
 
 interface Slot {
+  detection?: LineState['detection'];
   index: number;
   status: 'empty' | 'ringing' | 'answered';
   /** Set while the line holds a lead (ringing, answered, or waiting for its next ring). */
@@ -128,6 +129,7 @@ interface Active {
 
 /** A manual call (callNumber) from dialing until its wrap-up (if any) is done. */
 interface Manual {
+  detection?: LineState['detection'];
   /** The session was opened for this call (we were idle): close it afterwards. Else back to paused. */
   ownsSession: boolean;
   lead: Lead;
@@ -155,6 +157,7 @@ interface Pending {
 function emptySlot(index: number): Slot {
   return {
     index,
+    detection: undefined,
     status: 'empty',
     lead: null,
     phones: [],
@@ -172,6 +175,7 @@ function emptySlot(index: number): Slot {
 
 function resultForEnd(reason: EndReason): CallResult {
   switch (reason) {
+    case 'voicemail': return 'voicemail';
     case 'busy':
       return 'busy';
     case 'failed':
@@ -565,8 +569,8 @@ export class DialerEngine implements DialerControls {
           leadId: lead.id,
           ring: 1,
           ringSeconds: this.settings.ringSeconds,
-          // Never auto-skip: someone testing with their own phone should hear their voicemail.
-          detectMachine: false,
+          manual: true,
+          detectMachine: this.settings.skipVoicemail,
           record: this.settings.recordCalls,
         });
       } catch (e) {
@@ -576,7 +580,7 @@ export class DialerEngine implements DialerControls {
       const startedAtMs = this.now();
       let recordId: string;
       try {
-        const rec = await this.api.createCall({
+        const rec = this.telephony.kind==='telnyx' ? {id:callId} : await this.api.createCall({
           leadId: found ? found.id : null,
           direction: 'outbound',
           fromNumber: from,
@@ -643,6 +647,7 @@ export class DialerEngine implements DialerControls {
     return {
       index: s.index,
       status: s.status,
+      detection: s.detection,
       lead: s.lead,
       phone: s.phones[s.phoneIdx] ?? '',
       fromNumber: s.fromNumber,
@@ -660,6 +665,7 @@ export class DialerEngine implements DialerControls {
         {
           index: 0,
           status: m.status,
+          detection: m.detection,
           lead: m.lead,
           phone: m.phone,
           fromNumber: m.fromNumber,
@@ -742,6 +748,7 @@ export class DialerEngine implements DialerControls {
       return await p;
     } catch (e) {
       warn(context, e);
+      this.commit({error: 'Problem '+context+': '+errorMessage(e)});
       return undefined;
     }
   }
@@ -851,10 +858,12 @@ export class DialerEngine implements DialerControls {
     // Reserve every slot first so a failure part-way releases all of them.
     use.forEach((lead, i) => {
       const s = empty[i];
+      const phones = lead.phones.filter(p => lead.attemptPlan?.[p]?.ring !== 0);
+      const first = lead.attemptPlan?.[phones[0]];
       Object.assign(s, emptySlot(s.index), {
         lead,
-        phones: [...lead.phones],
-        next: { ring: 1, phoneIdx: 0, fromNumber: null } satisfies NextRing,
+        phones,
+        next: { ring: first?.ring === 2 ? 2 : 1, phoneIdx: 0, fromNumber: first?.ring === 2 ? first.from : null } satisfies NextRing,
       });
     });
     // Ring every line at the same moment. One after another, each line started about a second
@@ -865,7 +874,12 @@ export class DialerEngine implements DialerControls {
     for (let i = 0; i < targets.length; i++) {
       const p = placed[i];
       if (p.ok) this.startRinging(targets[i], targets[i].next!, p);
-      else failure ??= p.message;
+      else if(p.message.includes('[attempt_conflict]')) {
+        const id=targets[i].lead!.id;
+        Object.assign(targets[i],emptySlot(targets[i].index));
+        await this.release([id]);
+        this.schedulePoll();
+      } else failure ??= p.message;
     }
     // The lines that did start are hung up and their leads released by the fatal stop.
     if (failure) await this.enterFatal(failure);
@@ -882,6 +896,12 @@ export class DialerEngine implements DialerControls {
     }
     const placed = await this.placeRing(lead, slot.phones[next.phoneIdx], next);
     if (!placed.ok) {
+      if(placed.message.includes('[attempt_conflict]')) {
+        Object.assign(slot,emptySlot(slot.index));
+        await this.release([lead.id]);
+        this.schedulePoll();
+        return true;
+      }
       await this.enterFatal(placed.message);
       return false;
     }
@@ -922,6 +942,7 @@ export class DialerEngine implements DialerControls {
     }
 
     const startedAtMs = this.now();
+    if (this.telephony.kind==='telnyx') return {ok:true,from,callId,recordId:callId,startedAtMs};
     try {
       const rec = await this.api.createCall({
         leadId: lead.id,
@@ -943,6 +964,7 @@ export class DialerEngine implements DialerControls {
   private startRinging(slot: Slot, next: NextRing, placed: PlacedRing): void {
     const { callId } = placed;
     slot.status = 'ringing';
+    slot.detection = undefined;
     slot.phoneIdx = next.phoneIdx;
     slot.ring = next.ring;
     slot.fromNumber = placed.from;
@@ -975,7 +997,8 @@ export class DialerEngine implements DialerControls {
     if (result !== 'bad_number' && slot.ring === 1 && this.settings.doubleRing) {
       next = { ring: 2, phoneIdx: slot.phoneIdx, fromNumber: slot.fromNumber };
     } else if (slot.phoneIdx + 1 < slot.phones.length) {
-      next = { ring: 1, phoneIdx: slot.phoneIdx + 1, fromNumber: null };
+      const plan = slot.lead.attemptPlan?.[slot.phones[slot.phoneIdx + 1]];
+      next = { ring: plan?.ring === 2 ? 2 : 1, phoneIdx: slot.phoneIdx + 1, fromNumber: plan?.ring === 2 ? plan.from : null };
     }
 
     if (!next) {
@@ -1015,13 +1038,14 @@ export class DialerEngine implements DialerControls {
       if (s.status === 'answered') continue;
       const callId = s.callId;
       const recordId = s.callRecordId;
+      const finishingMessage = !!except && s.detection === 'voicemail';
       ids.push(s.lead.id);
       if (s.timer) clearTimeout(s.timer);
       Object.assign(s, emptySlot(s.index));
       if (callId) {
         if (result === 'dropped') this.rememberDropped(callId, recordId);
-        updates.push(this.hangupQuietly(callId));
-        if (recordId) updates.push(this.safe('dropping line', this.api.updateCall(recordId, { endedAt, result })));
+        if (!finishingMessage) updates.push(this.hangupQuietly(callId));
+        if (recordId) updates.push(this.safe('dropping line', this.api.updateCall(recordId, { endedAt, result: finishingMessage ? 'voicemail' : result })));
       }
     }
     if (ids.length) this.commit();
@@ -1041,6 +1065,12 @@ export class DialerEngine implements DialerControls {
     const slot = this.slots[index];
     if (!slot || slot.callId !== callId || slot.status !== 'ringing') return;
     const recordId = slot.callRecordId;
+    if (this.telephony.kind === 'telnyx') {
+      // The terminal event drives ring two once the provider has released this number.
+      try {await this.telephony.hangup(callId);}
+      catch (e) {await this.enterFatal("Couldn't end the call: "+errorMessage(e));}
+      return;
+    }
     this.detach(callId);
     await this.hangupQuietly(callId);
     if (recordId) await this.safe('ring timeout', this.api.updateCall(recordId, { endedAt: this.iso(), result: 'no_answer' }));
@@ -1055,6 +1085,18 @@ export class DialerEngine implements DialerControls {
   private async handleEvent(e: TelephonyEvent): Promise<void> {
     if (this.disposed) return;
     switch (e.type) {
+      case 'checking':
+      case 'screening':
+      case 'voicemail': {
+        const line = this.slotForCall(e.callId) ?? (this.manual?.callId === e.callId ? this.manual : null);
+        if (!line || line.status !== 'ringing') return;
+        if (line.timer) clearTimeout(line.timer);
+        line.detection = e.type;
+        line.timer = setTimeout(() => void this.run(() => 'index' in line
+          ? this.onRingTimeout(line.index, e.callId) : this.onManualRingTimeout(e.callId)).catch(err => warn('detection timeout',err)), 90_000);
+        this.commit();
+        return;
+      }
       case 'ringing':
         return;
       case 'answered':

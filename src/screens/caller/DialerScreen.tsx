@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
+import { RecoveredNotes } from './RecoveredNotes';
+import CallerMessages from './CallerMessages';
+import { getSupabase } from '../../api/supabaseClient';
 import { api } from '../../api';
 import { useAuth } from '../../auth/AuthContext';
 import { useDialer } from '../../dialer/useDialer';
@@ -31,7 +34,7 @@ function useSettings(): Settings | null {
 /** The real dialer, wired to the shared engine. */
 function LiveDialer() {
   const { state, controls } = useDialer();
-  const { profile } = useAuth();
+  const { profile, isDemo } = useAuth();
   const settings = useSettings();
   const [stats, setStats] = useState<MetricsTotals | null>(null);
   const [callbacksDue, setCallbacksDue] = useState<number | null>(null);
@@ -54,16 +57,26 @@ function LiveDialer() {
     };
   }, [idle]);
 
+  const [names,setNames] = useState<Record<string,string>>({});
+  useEffect(()=>{
+    if(isDemo) return;
+    let alive=true;
+    void getSupabase().rpc('list_profile_names').then(({data})=>{if(alive && data) setNames(Object.fromEntries(data.map((p:{id:string;full_name:string})=>[p.id,p.full_name])));});
+    return ()=>{alive=false;};
+  },[isDemo,profile?.id]);
   const data = useMemo<DialerDataSource>(
     () => ({
+      names,
+      getLead: id => api.getLead(id),
       getLeadHistory: (id) => api.getLeadHistory(id),
       updateLead: (id, patch) => api.updateLead(id, patch),
     }),
-    [],
+    [names],
   );
 
   return (
     <DialerView
+      topSlot={idle && !isDemo && profile ? <><RecoveredNotes callerId={profile.id}/><CallerMessages callerId={profile.id}/></> : null}
       state={state}
       controls={controls}
       settings={settings}

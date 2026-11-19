@@ -766,6 +766,35 @@
   line-height: 26px;
 }
 
+/* Lead notes from the imported list, right under the property row during a call. */
+.dl-lead-notes {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 6px);
+  background: var(--surface, var(--bg));
+  font-size: var(--font-sm);
+}
+
+.dl-lead-notes-label {
+  color: var(--text-muted);
+  line-height: 22px;
+}
+
+.dl-lead-notes-text {
+  margin: 0;
+  line-height: 22px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+@media (max-width: 640px) {
+  .dl-lead-notes { grid-template-columns: 1fr; gap: var(--space-1); }
+}
+
 .dl-subhead {
   margin-top: var(--space-6);
   padding-bottom: var(--space-2);

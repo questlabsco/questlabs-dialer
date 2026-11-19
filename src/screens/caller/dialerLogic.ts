@@ -227,6 +227,8 @@ export function formatPhoneAsTyped(input: string): string {
 /** Plain sentence for how a manual call ended without anyone connected. */
 export function manualEndedText(result: string, phone: string): string {
   switch (result) {
+    case 'voicemail':
+      return 'Voicemail answered at '+phone;
     case 'busy':
       return `${phone} was busy`;
     case 'bad_number':

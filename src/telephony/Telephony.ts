@@ -21,6 +21,7 @@ export interface DialRequest {
   ringSeconds?: number;
   /** Ask the provider to run answering-machine detection (Settings.skipVoicemail). Default true. */
   detectMachine?: boolean;
+  manual?: boolean;
   /** Ask the provider to record if answered (Settings.recordCalls). Default false. */
   record?: boolean;
 }
@@ -28,6 +29,7 @@ export interface DialRequest {
 export type EndReason =
   /** Rang out without pickup. */
   | 'no_answer'
+  | 'voicemail'
   | 'busy'
   /** Network / carrier failure. */
   | 'failed'
@@ -41,6 +43,7 @@ export type EndReason =
 export type TelephonyEvent =
   /** The far end is ringing. */
   | { type: 'ringing'; callId: string }
+  | { type: 'checking' | 'screening' | 'voicemail'; callId: string }
   /** Someone picked up; audio is live to the caller immediately. */
   | { type: 'answered'; callId: string }
   /** Answering machine detected shortly after `answered`. The engine decides whether to hang up. */

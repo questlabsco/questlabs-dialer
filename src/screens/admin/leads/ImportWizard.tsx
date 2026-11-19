@@ -187,7 +187,7 @@ export function ImportWizard({ open, lists, users, onClose }: Props) {
     let precheck = true;
     try {
       const existing = await api.exportLeads({});
-      prepared = markExisting(rows, new Set(existing.map((l) => l.phones[0]).filter(Boolean)));
+      prepared = markExisting(rows, new Set(existing.flatMap((l) => l.phones).filter(Boolean)));
     } catch {
       precheck = false;
     }

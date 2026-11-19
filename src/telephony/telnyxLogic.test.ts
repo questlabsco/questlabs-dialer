@@ -6,6 +6,7 @@ import {
   agentBridgeBody,
   amdOutcome,
   buildDialBody,
+  isInvalidDestination,
   screeningIntroSpeakBody,
   screeningIntroText,
   buildRingBody,
@@ -414,6 +415,15 @@ describe('buildDialBody', () => {
     expect(clampRingSeconds(undefined, 22)).toBe(22);
     expect(clampRingSeconds(Number.NaN, 30)).toBe(30);
     expect(clampRingSeconds(21.6, 22)).toBe(22);
+  });
+});
+
+describe('isInvalidDestination', () => {
+  it('spots a refused number (D11) but not account or capacity errors', () => {
+    expect(isInvalidDestination(['D11'], 'Destination Number is invalid')).toBe(true);
+    expect(isInvalidDestination([''], 'Destination Number is invalid D11. The destination number is invalid.')).toBe(true);
+    expect(isInvalidDestination(['D1'], 'User channel limit exceeded')).toBe(false);
+    expect(isInvalidDestination(['10010'], 'Invalid connection')).toBe(false);
   });
 });
 

@@ -543,7 +543,7 @@ export class DemoApi implements Api {
       listId = nextId(this.state, 'list');
       this.state.lists.push({ id: listId, name, createdAt: this.iso() });
     }
-    const primaries = new Set(this.state.leads.map((l) => l.phones[0]).filter(Boolean));
+    const primaries = new Set(this.state.leads.flatMap((l) => l.phones).filter(Boolean));
     let imported = 0;
     let duplicates = 0;
     let invalid = 0;
@@ -561,11 +561,11 @@ export class DemoApi implements Api {
         invalid++;
         continue;
       }
-      if (primaries.has(phones[0])) {
+      if (phones.some(p=>primaries.has(p))) {
         duplicates++;
         continue;
       }
-      primaries.add(phones[0]);
+      phones.forEach(p=>primaries.add(p));
       let assignedTo: string | null = null;
       if (assign.mode === 'caller') assignedTo = assign.callerId;
       else if (assign.mode === 'round_robin') assignedTo = assign.callerIds[rr++ % assign.callerIds.length];

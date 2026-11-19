@@ -25,8 +25,8 @@ async function functionErrorMessage(error: unknown): Promise<string> {
   const ctx = (error as { context?: unknown })?.context;
   if (ctx && typeof (ctx as Response).json === 'function') {
     try {
-      const body = (await (ctx as Response).clone().json()) as { error?: string };
-      if (body?.error) return body.error;
+      const body = (await (ctx as Response).clone().json()) as { error?: string; code?: string };
+      if (body?.error) return body.code==='attempt_conflict' ? '[attempt_conflict] '+body.error : body.error;
     } catch {
       /* not JSON */
     }

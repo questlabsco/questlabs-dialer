@@ -32,18 +32,26 @@ export interface CallDraft {
 const EMPTY_DRAFT: CallDraft = { notes: '', disposition: null, callbackAt: null, phoneInUse: null };
 const drafts = new Map<string, CallDraft>();
 
-export function clearCallDraft(callRecordId: string): void {
+export function clearCallDraft(callRecordId: string, callerId: string): void {
+  try { localStorage.removeItem('call-draft:'+callerId+':'+callRecordId); } catch { /* storage unavailable */ }
   drafts.delete(callRecordId);
 }
 
 /** `[draft, update]` for one call (keyed by CallRecord id). */
-export function useCallDraft(callRecordId: string | null): [CallDraft, (patch: Partial<CallDraft>) => void] {
+export function useCallDraft(callRecordId: string | null, callerId: string): [CallDraft, (patch: Partial<CallDraft>) => void] {
   const [, force] = useReducer((x: number) => x + 1, 0);
+  if(callRecordId && !drafts.has(callRecordId)) {
+    try {
+      const saved=localStorage.getItem('call-draft:'+callerId+':'+callRecordId);
+      if(saved) drafts.set(callRecordId,{...EMPTY_DRAFT,...JSON.parse(saved)});
+    } catch { /* storage unavailable */ }
+  }
   const draft = (callRecordId && drafts.get(callRecordId)) || EMPTY_DRAFT;
   const update = useCallback(
     (patch: Partial<CallDraft>) => {
       if (!callRecordId) return;
       drafts.set(callRecordId, { ...(drafts.get(callRecordId) ?? EMPTY_DRAFT), ...patch });
+      try { localStorage.setItem('call-draft:'+callerId+':'+callRecordId,JSON.stringify(drafts.get(callRecordId))); } catch { /* keep in memory */ }
       // Keep the map small: drop the oldest entries.
       while (drafts.size > 30) {
         const first = drafts.keys().next().value;
@@ -52,7 +60,7 @@ export function useCallDraft(callRecordId: string | null): [CallDraft, (patch: P
       }
       force();
     },
-    [callRecordId],
+    [callRecordId,callerId],
   );
   return [draft, update];
 }

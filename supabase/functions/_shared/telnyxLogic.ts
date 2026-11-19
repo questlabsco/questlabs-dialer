@@ -12,9 +12,9 @@
 // Our event vocabulary (mirrors src/telephony/Telephony.ts; kept local so this file has no imports)
 // ---------------------------------------------------------------------------
 
-export type EndReason = 'no_answer' | 'busy' | 'failed' | 'bad_number' | 'hangup_local' | 'hangup_remote';
+export type EndReason = 'voicemail' | 'no_answer' | 'busy' | 'failed' | 'bad_number' | 'hangup_local' | 'hangup_remote';
 
-export type TelephonyEventType = 'ringing' | 'answered' | 'machine' | 'ended' | 'incoming' | 'error';
+export type TelephonyEventType = 'checking' | 'screening' | 'voicemail' | 'ringing' | 'answered' | 'machine' | 'ended' | 'incoming' | 'error';
 
 /** A row of `telephony_events` as the app receives it. */
 export interface TelephonyEventRow {
@@ -113,7 +113,7 @@ export const FIRST_COMMAND_TIMEOUT_SECS = 45;
 
 export type ClientState =
   /** An outbound lead leg placed by telnyx-dial. `id` = our call id (telephony_calls.id). */
-  | { v: 1; k: 'out'; id: string }
+  | { v: 1; k: 'out'; id: string; playback?: 'screening' | 'voicemail' }
   /**
    * An inbound leg. `st` = what to do on the next `call.answered`: 'bridge' to the agent leg, or
    * 'polite' (speak the missed-call message, then hang up).
@@ -159,7 +159,7 @@ export function decodeClientState(raw: unknown): ClientState | null {
   if (!parsed || typeof parsed !== 'object') return null;
   const o = parsed as Record<string, unknown>;
   if (o.v !== 1) return null;
-  if (o.k === 'out' && typeof o.id === 'string' && ID_RE.test(o.id)) return { v: 1, k: 'out', id: o.id };
+  if (o.k === 'out' && typeof o.id === 'string' && ID_RE.test(o.id)) return { v: 1, k: 'out', id: o.id, ...(o.playback === 'voicemail' || o.playback === 'screening' ? { playback:o.playback } : {}) };
   if (o.k === 'in' && typeof o.id === 'string' && ID_RE.test(o.id)) {
     if (o.st === undefined) return { v: 1, k: 'in', id: o.id };
     if (o.st === 'bridge' || o.st === 'polite') return { v: 1, k: 'in', id: o.id, st: o.st };
@@ -681,6 +681,10 @@ export interface DialBodyInput {
   /** Also detect iPhone call screening (a screening intro is set). */
   screeningIntro?: boolean;
   record: boolean;
+}
+
+export function isInvalidDestination(codes: readonly string[], message: string): boolean {
+  return codes.some(c => c.toUpperCase() === 'D11') || /destination number is invalid/i.test(message);
 }
 
 export function clampRingSeconds(s: unknown, fallback: number): number {

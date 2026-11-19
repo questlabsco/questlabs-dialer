@@ -6,6 +6,7 @@ import { formatDateTime, formatDuration, formatPhone } from '../../lib/format';
 import { isUnknownLead, isValidEmail } from './dialerLogic';
 
 export interface LeadDataSource {
+  names?: Record<string,string>;
   getLeadHistory(leadId: string): Promise<CallRecord[]>;
 }
 
@@ -187,7 +188,7 @@ function LeadHistory({ leadId, data, callerId, excludeCallRecordId }: { leadId: 
                   {formatDateTime(r.startedAt)}
                   {r.direction === 'inbound' && <span className="cell-sub"> (inbound)</span>}
                 </td>
-                <td>{r.callerId === callerId ? 'You' : r.callerId ? 'Teammate' : 'Nobody'}</td>
+                <td>{r.callerId === callerId ? 'You' : r.callerId ? (data.names?.[r.callerId] || 'Teammate') : 'Nobody'}</td>
                 <td>{outcome ? <Badge tone={outcome.tone}>{outcome.label}</Badge> : <Badge>{r.result ? CALL_RESULT_LABELS[r.result] : 'In progress'}</Badge>}</td>
                 <td className="align-right num">{r.talkSeconds > 0 ? formatDuration(r.talkSeconds) : '-'}</td>
                 <td className="cell-truncate dl-history-notes" title={r.notes || undefined}>
@@ -245,6 +246,18 @@ export function LeadHighlights({ lead, phoneInUse }: { lead: Lead; phoneInUse: s
   );
 }
 
+/** The lead's notes from the imported list, shown near the top while on a call. */
+export function LeadNotes({ lead }: { lead: Lead }) {
+  const notes = isUnknownLead(lead) ? '' : (lead.notes ?? '').trim();
+  if (!notes) return null;
+  return (
+    <section className="dl-lead-notes" aria-label="Lead notes">
+      <div className="dl-lead-notes-label">Lead notes</div>
+      <p className="dl-pre dl-lead-notes-text">{notes}</p>
+    </section>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Lead panel
 // ---------------------------------------------------------------------------
@@ -259,9 +272,11 @@ export interface LeadPanelProps {
   currentCallRecordId?: string | null;
   onSaveField: (field: 'contactName' | 'email', value: string) => Promise<void>;
   compact?: boolean;
+  /** The notes are already shown elsewhere on screen (LeadNotes). */
+  hideNotes?: boolean;
 }
 
-export function LeadPanel({ lead, phoneInUse, callerId, data, currentCallRecordId, onSaveField, compact }: LeadPanelProps) {
+export function LeadPanel({ lead, phoneInUse, callerId, data, currentCallRecordId, onSaveField, compact, hideNotes }: LeadPanelProps) {
   if (isUnknownLead(lead)) {
     const number = lead.phones[0] ?? lead.id.slice('unknown:'.length);
     return (
@@ -296,7 +311,7 @@ export function LeadPanel({ lead, phoneInUse, callerId, data, currentCallRecordI
               })}
             </ul>
           </div>
-          {lead.notes && (
+          {lead.notes && !hideNotes && (
             <div className="dl-kv">
               <div className="dl-kv-label">List notes</div>
               <p className="dl-pre">{lead.notes}</p>

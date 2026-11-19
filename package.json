@@ -1,7 +1,7 @@
 {
   "name": "questlabs-dialer",
   "productName": "Quest Labs Dialer",
-  "version": "1.0.6",
+  "version": "1.0.8",
   "private": true,
   "description": "Quest Labs Dialer - CRM and multi-line power dialer",
   "author": "Quest Labs",

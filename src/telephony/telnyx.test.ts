@@ -25,6 +25,7 @@ class FakeBackend implements TelnyxBackend {
     if (fn === 'telnyx-agent' && body.action === 'start') return { sessionId: `sess-${this.calls.length}` } as T;
     if (fn === 'telnyx-agent' && body.action === 'status') return { status: this.agentStatus } as T;
     if (fn === 'telnyx-dial') return { callId: `call-${++this.dialSeq}` } as T;
+    if (fn === 'telnyx-call' && body.action === 'confirm_end') return {ok:true,alreadyEnded:true} as T;
     return { ok: true } as T;
   }
   async userId() {
@@ -225,6 +226,8 @@ describe('TelnyxTelephony events', () => {
     await t.connect();
     const id = await t.dial({ to: '+12145550002', from: '+12145550001', leadId: 'l1', ring: 2, ringSeconds: 20, detectMachine: true, record: false });
     expect(backend.fnCalls('telnyx-dial')[0].body).toEqual({
+      sessionId: 'sess-1',
+      manual: false,
       to: '+12145550002',
       from: '+12145550001',
       leadId: 'l1',
@@ -295,7 +298,7 @@ describe('TelnyxTelephony events', () => {
 });
 
 describe('TelnyxTelephony calls', () => {
-  it('hangup asks the server and falls back to a local ended if the server event never comes', async () => {
+  it('hangup verifies the leg ended when the terminal webhook never comes', async () => {
     const { t, backend, events } = await setup();
     await t.connect();
     const id = await t.dial({ to: '+12145550002', from: '+12145550001', leadId: 'l1', ring: 1 });

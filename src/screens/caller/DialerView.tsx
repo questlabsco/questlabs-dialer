@@ -30,7 +30,7 @@ import type { CallRecord, Lead, MetricsTotals, Settings } from '../../types';
 import type { DialerControls, DialerSessionStats, DialerState, LineState } from '../../dialer/types';
 import { formatDuration, formatDurationLong, formatNumber, formatPercent, formatPhone } from '../../lib/format';
 import { CallBar } from './CallBar';
-import { LeadHighlights, LeadPanel } from './LeadPanel';
+import { LeadHighlights, LeadNotes, LeadPanel } from './LeadPanel';
 import { ManualDial, TonePad } from './ManualDial';
 import { MicCheck } from './MicCheck';
 import ScriptPanel from './ScriptPanel';
@@ -40,6 +40,8 @@ import { isEditableTarget, isUnknownLead, manualEndedText, resolveShortcut, seco
 import './caller.css';
 
 export interface DialerDataSource {
+  names?: Record<string,string>;
+  getLead?(id:string):Promise<Lead>;
   getLeadHistory(leadId: string): Promise<CallRecord[]>;
   updateLead(id: string, patch: Pick<LeadPatch, 'contactName' | 'email'>): Promise<Lead>;
 }
@@ -107,7 +109,7 @@ function LineCard({ line, now, ringSeconds }: { line: LineState; now: number; ri
     <div className={`dl-line${answered ? ' dl-line-answered' : ''}`} aria-label={line.manual ? 'Manual call' : `Line ${line.index + 1}`}>
       <span className="dl-line-no">Line {line.index + 1}</span>
       <span className="dl-line-status">
-        {answered ? <Badge tone="good">Picked up</Badge> : <Badge tone="accent">Ringing</Badge>}
+        {answered ? <Badge tone="good">Picked up</Badge> : <Badge tone="accent">{line.detection === 'screening' ? 'iPhone screening' : line.detection === 'voicemail' ? 'Voicemail' : line.detection === 'checking' ? 'Checking pickup' : 'Ringing'}</Badge>}
         {line.ring === 2 && <Badge tone="warning">2nd ring</Badge>}
       </span>
       <span className="dl-line-who">
@@ -213,10 +215,18 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
   );
 
   const callRecordId = state.activeCall?.callRecordId ?? state.wrapUp?.callRecordId ?? null;
-  const [draft, updateDraft] = useCallDraft(callRecordId);
+  const [draft, updateDraft] = useCallDraft(callRecordId,callerId);
 
   const baseLead = state.activeCall?.lead ?? state.wrapUp?.lead ?? null;
-  const lead: Lead | null = baseLead ? { ...baseLead, ...getEdit(baseLead.id) } : null;
+  const [fresh,setFresh] = useState<Lead|null>(null);
+  const id = baseLead?.id;
+  useEffect(() => {
+    let alive=true;
+    setFresh(null);
+    if(id && !id.startsWith('unknown:')) void data.getLead?.(id).then(l=>{if(alive) setFresh(l);}).catch(()=>{});
+    return ()=>{alive=false;};
+  },[id,callRecordId,data]);
+  const lead: Lead | null = baseLead ? { ...baseLead, ...(fresh?.id===id ? fresh : null), ...getEdit(baseLead.id) } : null;
 
   // Remember which phone was used so wrap-up can still highlight it.
   const activePhone = state.activeCall ? (state.activeCall.direction === 'inbound' ? state.activeCall.fromNumber : state.activeCall.toNumber) : null;
@@ -256,13 +266,13 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
     setSaveError(null);
     try {
       await controls.submitDisposition({ disposition: draft.disposition, notes: draft.notes.trim(), callbackAt: needsTime ? draft.callbackAt : null });
-      clearCallDraft(id);
+      clearCallDraft(id,callerId);
     } catch (e) {
       setSaveError(`Not saved: ${errorMessage(e)}`);
     } finally {
       setSaving(false);
     }
-  }, [state.wrapUp, saving, draft, controls]);
+  }, [state.wrapUp, saving, draft, controls, callerId]);
 
   const saveLeadField = useCallback(
     async (field: 'contactName' | 'email', value: string) => {
@@ -476,6 +486,8 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
           onDigit={(d) => void controls.sendDigits(d).catch((e) => toast.error(errorMessage(e)))}
         />
         <LeadHighlights lead={lead} phoneInUse={activePhone} />
+        <LeadNotes lead={lead} />
+        <LeadPanel lead={lead} phoneInUse={activePhone} callerId={callerId} data={data} currentCallRecordId={call.callRecordId} onSaveField={saveLeadField} hideNotes />
         <div className="dl-grid dl-grid-call">
           <ScriptPanel lead={lead} callerName={callerName} />
           <Card title="Notes" actions={<span className="muted dl-small">Kept for wrap-up</span>} className="dl-notes-card">
@@ -489,7 +501,7 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
           </Card>
           <TonePad onDigit={(d) => void controls.sendDigits(d).catch((e) => toast.error(errorMessage(e)))} />
         </div>
-        <LeadPanel lead={lead} phoneInUse={activePhone} callerId={callerId} data={data} currentCallRecordId={call.callRecordId} onSaveField={saveLeadField} />
+
       </>
     );
   } else if (phase === 'wrap_up' && state.wrapUp && lead) {
@@ -597,6 +609,7 @@ export function DialerView({ state, controls, settings, callerId, callerName, st
           </>
         }
       />
+      {state.error && phase !== 'error' && <p role="alert">{state.error}</p>}
       {topSlot}
       {state.incoming && (
         <IncomingBanner

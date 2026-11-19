@@ -40,12 +40,17 @@ serve(async (req) => {
   const ccid = call.call_control_id as string | null;
 
   switch (body.action) {
+    case 'confirm_end': {
+      if (!ccid) throw new HttpError(409,'Waiting for the provider call ID.','pending');
+      // A fresh command distinguishes an already-ended leg from a lost hangup request.
+      const sent = await callCommand(ccid,'hangup',{});
+      if (!sent) await endWithoutTelnyx(call.id,user.id,'hangup_local');
+      return json({ok:true,alreadyEnded:!sent});
+    }
     case 'hangup': {
       await db.from('telephony_calls').update({ local_end_reason: 'hangup_local' }).eq('id', call.id);
       if (!ccid) {
-        // Dial accepted but Telnyx ids not stored yet (or dial failed): end it ourselves.
-        await endWithoutTelnyx(call.id as string, user.id, 'hangup_local');
-        return json({ ok: true });
+        throw new HttpError(409,'Waiting for the provider call ID.','pending');
       }
       const sent = await callCommand(ccid, 'hangup', { command_id: `hangup-${call.id}` });
       if (!sent) await endWithoutTelnyx(call.id as string, user.id, 'hangup_local');

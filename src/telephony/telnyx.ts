@@ -45,6 +45,7 @@ export interface TelnyxTelephonyOptions {
 }
 
 interface KnownCall {
+  detection?: 'checking' | 'screening' | 'voicemail';
   direction: 'outbound' | 'inbound';
   answered: boolean;
   ended: boolean;
@@ -108,6 +109,7 @@ export class TelnyxTelephony implements Telephony {
   private backend: TelnyxBackend | null;
   private rtc: RtcClient | null = null;
   private agentCall: RtcAgentCall | null = null;
+  private leaseTimer: unknown=null;
   private agentSessionId: string | null = null;
   private recoveringAgent = false;
 
@@ -291,7 +293,7 @@ export class TelnyxTelephony implements Telephony {
     const backend = await this.getBackend();
     const rtc = this.rtc;
     if (!rtc) throw new Error('Telnyx is not connected.');
-    const { sessionId } = await backend.invoke<{ sessionId: string }>('telnyx-agent', { action: 'start' });
+    const { sessionId } = await backend.invoke<{ sessionId: string }>('telnyx-agent', { action: 'start', ...(this.agentSessionId ? {sessionId:this.agentSessionId} : {}) });
     this.agentSessionId = sessionId;
     const call = rtc.startAgentLeg({
       sessionId,
@@ -301,6 +303,14 @@ export class TelnyxTelephony implements Telephony {
     });
     this.agentCall = call;
     await this.waitForAgentLive(call, sessionId);
+    if(this.leaseTimer) this.clearT(this.leaseTimer);
+    const renew=async()=>{
+      if(this.agentSessionId!==sessionId || this.disconnecting) return;
+      try {await backend.invoke('telnyx-agent',{action:'heartbeat',sessionId});}
+      catch { /* A short network interruption can recover on the next heartbeat. */ }
+      if(this.agentSessionId===sessionId) this.leaseTimer=this.setT(()=>void renew(),30000);
+    };
+    this.leaseTimer=this.setT(()=>void renew(),30000);
   }
 
   /** The leg is usable once the SDK reports it active OR the server reports the session live. */
@@ -355,6 +365,8 @@ export class TelnyxTelephony implements Telephony {
     const backend = this.backend;
     const sessionId = this.agentSessionId;
     this.agentSessionId = null;
+    if(this.leaseTimer) this.clearT(this.leaseTimer);
+    this.leaseTimer=null;
     const call = this.agentCall;
     this.agentCall = null;
     if (call) await call.hangup().catch(() => {});
@@ -506,6 +518,7 @@ export class TelnyxTelephony implements Telephony {
     const callerId = this.callerId;
     if (!backend || !callerId) return;
     const gen = ++this.subscriptionGen;
+    const cursor = this.lastEventId;
     this.unsubscribe?.();
     this.unsubscribe = backend.subscribe(
       callerId,
@@ -513,15 +526,15 @@ export class TelnyxTelephony implements Telephony {
         if (gen === this.subscriptionGen) this.handleRow(row);
       },
       (status) => {
-        if (gen === this.subscriptionGen) void this.onSubscriptionStatus(status);
+        if (gen === this.subscriptionGen) void this.onSubscriptionStatus(status,cursor);
       },
     );
   }
 
-  private async onSubscriptionStatus(status: SubscriptionStatus): Promise<void> {
+  private async onSubscriptionStatus(status: SubscriptionStatus,cursor:number): Promise<void> {
     if (status === 'subscribed') {
       this.resubscribeAttempt = 0;
-      await this.backfill();
+      await this.backfill(cursor,this.subscriptionGen);
       return;
     }
     if (this.disconnecting) return;
@@ -534,15 +547,21 @@ export class TelnyxTelephony implements Telephony {
     }, delay);
   }
 
-  private async backfill(): Promise<void> {
+  private async backfill(after:number,generation:number): Promise<void> {
     const backend = this.backend;
     const callerId = this.callerId;
     if (!backend || !callerId) return;
     try {
-      const rows = await backend.eventsSince(callerId, this.lastEventId);
-      for (const r of rows) this.handleRow(r);
+      let cursor = after;
+      for (;;) {
+        const rows = await backend.eventsSince(callerId, cursor);
+        if(generation!==this.subscriptionGen) return;
+        for (const r of rows) this.handleRow(r);
+        if (rows.length < 500) break;
+        cursor = rows[rows.length - 1].id;
+      }
     } catch {
-      /* the next (re)subscription back-fills again */
+      this.setT(()=>{if(generation===this.subscriptionGen && !this.disconnecting) void this.backfill(after,generation);},2000);
     }
   }
 
@@ -590,6 +609,14 @@ export class TelnyxTelephony implements Telephony {
     const call = this.calls.get(callId);
     if (!call || call.ended) return;
     switch (row.type) {
+      case 'checking':
+      case 'screening':
+      case 'voicemail':
+        if (call.answered || call.detection === row.type || call.detection === 'voicemail' || (row.type==='checking' && call.detection)) return;
+        call.detection=row.type;
+        for (const timer of call.timers) this.clearT(timer);
+        this.emit({ type: row.type, callId });
+        return;
       case 'ringing':
       case 'machine': {
         if (call.answered && row.type === 'ringing') return;
@@ -653,6 +680,8 @@ export class TelnyxTelephony implements Telephony {
       from: req.from,
       leadId: req.leadId,
       ring: req.ring,
+      manual: req.manual ?? false,
+      sessionId: this.agentSessionId,
       ...(req.ringSeconds !== undefined ? { ringSeconds: req.ringSeconds } : {}),
       ...(req.detectMachine !== undefined ? { detectMachine: req.detectMachine } : {}),
       ...(req.record !== undefined ? { record: req.record } : {}),
@@ -666,7 +695,7 @@ export class TelnyxTelephony implements Telephony {
       this.setT(() => {
         if (call.answered || call.ended) return;
         void this.callAction('hangup', callId).catch(() => {});
-        call.timers.push(this.setT(() => this.emitEnded(callId, 'failed'), LOCAL_END_FALLBACK_MS));
+        call.timers.push(this.setT(() => void this.confirmEnded(callId, 'failed'), LOCAL_END_FALLBACK_MS));
       }, ringMs + OUTBOUND_WATCHDOG_GRACE_MS),
     );
     // Deliver events that raced ahead of the dial response (after the caller has the id).
@@ -674,7 +703,21 @@ export class TelnyxTelephony implements Telephony {
     return callId;
   }
 
-  private async callAction(action: 'hangup' | 'answer' | 'decline' | 'timeout', callId: string) {
+  private async confirmEnded(callId:string, reason:EndReason):Promise<void> {
+    const call=this.calls.get(callId);
+    if(!call || call.ended) return;
+    try {
+      const result=await this.callAction('confirm_end',callId);
+      if(result.alreadyEnded) {this.emitEnded(callId,reason);return;}
+      await this.waitUntil(()=>call.ended,3000);
+      if(call.ended) return;
+      throw new Error('The provider still has an open call.');
+    } catch(e) {
+      this.emitError('Could not confirm hangup. Dialing paused. '+(e instanceof Error?e.message:''));
+    }
+  }
+
+  private async callAction(action: 'confirm_end' | 'hangup' | 'answer' | 'decline' | 'timeout', callId: string) {
     const backend = await this.getBackend();
     return backend.invoke<{ ok: boolean; alreadyEnded?: boolean }>('telnyx-call', { action, callId });
   }
@@ -687,13 +730,13 @@ export class TelnyxTelephony implements Telephony {
     try {
       res = await this.callAction('hangup', callId);
     } catch {
-      res = await this.callAction('hangup', callId).catch(() => null);
+      res = await this.callAction('hangup', callId);
     }
     // The server's `ended` (hangup_local) normally arrives within a second; never leave the engine
     // waiting if it does not.
     if (!call.ended) {
       call.timers.push(
-        this.setT(() => this.emitEnded(callId, 'hangup_local'), res?.alreadyEnded ? 3_000 : LOCAL_END_FALLBACK_MS),
+        this.setT(() => void this.confirmEnded(callId, 'hangup_local'), res?.alreadyEnded ? 3_000 : LOCAL_END_FALLBACK_MS),
       );
     }
   }

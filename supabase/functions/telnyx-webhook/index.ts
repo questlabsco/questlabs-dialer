@@ -123,21 +123,24 @@ Deno.serve(async (req) => {
 // ---------------------------------------------------------------------------
 
 /** A telephony_calls row (outbound lead leg, inbound parent, or inbound offer). */
-type CallRow = InboundRow & { machine: boolean };
+type CallRow = InboundRow & { machine: boolean; classify: boolean; wait_for_greeting:boolean; media_phase: string | null; has_screening: boolean; has_voicemail: boolean };
 
 async function findCall(w: ParsedWebhook): Promise<CallRow | null> {
   const db = adminClient();
   const cs = w.clientState;
   if (cs && (cs.k === 'out' || cs.k === 'in' || cs.k === 'ring')) {
-    const { data } = await db.from('telephony_calls').select('*').eq('id', cs.id).maybeSingle();
+    const { data,error } = await db.from('telephony_calls').select('*').eq('id', cs.id).maybeSingle();
+    if(error) throw error;
     if (data) return data as CallRow;
   }
   if (w.callControlId) {
-    const { data } = await db.from('telephony_calls').select('*').eq('call_control_id', w.callControlId).maybeSingle();
+    const { data,error } = await db.from('telephony_calls').select('*').eq('call_control_id', w.callControlId).maybeSingle();
+    if(error) throw error;
     if (data) return data as CallRow;
   }
   if (w.callLegId) {
-    const { data } = await db.from('telephony_calls').select('*').eq('call_leg_id', w.callLegId).maybeSingle();
+    const { data,error } = await db.from('telephony_calls').select('*').eq('call_leg_id', w.callLegId).maybeSingle();
+    if(error) throw error;
     if (data) return data as CallRow;
   }
   return null;
@@ -214,9 +217,13 @@ async function handleAgentLeg(w: ParsedWebhook): Promise<void> {
 // Outbound lead legs
 // ---------------------------------------------------------------------------
 
-async function handleOutbound(w: ParsedWebhook, row: CallRow): Promise<void> {
+export async function handleOutbound(w: ParsedWebhook, row: CallRow): Promise<void> {
   const db = adminClient();
   const callerId = row.caller_id;
+  if (w.eventType === 'call.playback.ended' && row.media_phase === 'voicemail' && w.clientState?.k === 'out' && w.clientState.playback === 'voicemail' && w.callControlId) {
+    await callCommand(w.callControlId,'hangup',{command_id:'vm-end-'+row.id});
+    return;
+  }
   switch (w.kind) {
     case 'initiated': {
       const patch: Record<string, unknown> = { status: 'ringing' };
@@ -227,7 +234,15 @@ async function handleOutbound(w: ParsedWebhook, row: CallRow): Promise<void> {
       return;
     }
     case 'answered':
+      if (row.classify) {
+        if (callerId && row.status !== 'ended') await emitEvent({callerId,callId:row.id,type:'checking'});
+        return;
+      }
       return answerOutbound(w, row);
+    case 'bridged':
+      if (callerId && row.status === 'answered' && !row.local_end_reason)
+        await emitEvent({callerId,callId:row.id,type:'answered'});
+      return;
     case 'machine':
       return onMachineEvent(w, row);
     case 'hangup':
@@ -282,35 +297,54 @@ async function answerOutbound(w: ParsedWebhook, row: CallRow): Promise<void> {
  * beep) still hangs up.
  */
 async function onMachineEvent(w: ParsedWebhook, row: CallRow): Promise<void> {
+  const ccid = w.callControlId ?? row.call_control_id;
+  if (!ccid || !row.caller_id || row.status === 'ended' || row.local_end_reason) return;
   const outcome = amdOutcome(w.eventType, w.machineResult);
-  if (!outcome || row.status !== 'answered') return;
-  const db = adminClient();
-  const settings = await loadSettings();
-  const intro = settings.screening_intro;
-
-  if (outcome === 'suspect' && intro) {
-    await db.from('telephony_calls').update({ machine: true }).eq('id', row.id);
+  if (!row.classify) {
+    if (row.status === 'answered' && (outcome === 'voicemail' || outcome === 'suspect'))
+      await emitEvent({callerId:row.caller_id,callId:row.id,type:'machine'});
     return;
   }
-  if (outcome === 'screening') {
-    const ccid = w.callControlId ?? row.call_control_id;
-    if (!intro || !ccid) return;
-    const { data: who } = row.caller_id
-      ? await db.from('profiles').select('full_name').eq('id', row.caller_id).maybeSingle()
-      : { data: null };
-    const text = screeningIntroText(intro, (who?.full_name as string | null) ?? null);
-    if (!text) return;
-    try {
-      await callCommand(ccid, 'speak', screeningIntroSpeakBody(text, row.id));
-    } catch (e) {
-      console.error('screening intro failed, trying the standard voice:', e instanceof Error ? e.message : String(e));
-      await callCommand(ccid, 'speak', screeningIntroSpeakBody(text, row.id, true)).catch(() => false);
+  // Replaying the human result can finish an interrupted bridge command. Its command id is stable.
+  if (w.machineResult?.startsWith('human')) return answerOutbound(w,row);
+  if (row.status === 'answered') return;
+  if (w.machineResult === 'not_sure' || w.machineResult === 'silence') {
+    await callCommand(ccid,'hangup',{command_id:'unknown-'+row.id});
+    return;
+  }
+  // A tone identifies the screener. Only the end of its question invites a response.
+  const isPrompt = w.machineResult === 'prompt_ended';
+  if (outcome === 'screening' && !isPrompt) {
+    await emitEvent({callerId:row.caller_id,callId:row.id,type:'screening'});
+    return;
+  }
+  if (!isPrompt && outcome !== 'voicemail' && !(outcome==='suspect' && !row.wait_for_greeting)) return;
+  const phase = isPrompt ? 'screening' : 'voicemail';
+  let update = adminClient().from('telephony_calls').update({media_phase:phase,machine:true})
+    .eq('id',row.id).in('status',['dialing','ringing']).is('local_end_reason',null);
+  if (isPrompt) update = update.or('media_phase.is.null,media_phase.eq.screening');
+  const {data,error} = await update.select('id');
+  if (error) throw error;
+  if (!data?.length) return;
+  await emitEvent({callerId:row.caller_id,callId:row.id,type:phase});
+  if (isPrompt ? row.has_screening : row.has_voicemail && w.machineResult === 'beep_detected') {
+    const {data:file,error:signError} = await adminClient().storage.from('caller-messages')
+      .createSignedUrl(row.caller_id+'/'+phase+'.wav',300);
+    if (signError) throw signError;
+    await callCommand(ccid,'playback_start',{audio_url:file.signedUrl,command_id:phase+'-'+row.id,
+      client_state:encodeClientState({v:1,k:'out',id:row.id,playback:phase})});
+  } else if (isPrompt) {
+    const settings = await loadSettings();
+    const {data:who} = await adminClient().from('profiles').select('full_name').eq('id',row.caller_id).maybeSingle();
+    const intro = screeningIntroText(settings.screening_intro,who?.full_name);
+    if (intro) {
+      try {await callCommand(ccid,'speak',screeningIntroSpeakBody(intro,row.id));}
+      catch {await callCommand(ccid,'speak',screeningIntroSpeakBody(intro,row.id,true));}
     }
-    return;
+    else await callCommand(ccid,'hangup',{command_id:'no-intro-'+row.id});
+  } else {
+    await callCommand(ccid,'hangup',{command_id:'vm-end-'+row.id});
   }
-  // Voicemail (or a machine with no intro set): tell the app once; it hangs up.
-  await db.from('telephony_calls').update({ machine: true }).eq('id', row.id);
-  if (row.caller_id) await emitEvent({ callerId: row.caller_id, callId: row.id, type: 'machine' });
 }
 
 async function endCall(w: ParsedWebhook, row: CallRow): Promise<void> {
@@ -327,12 +361,13 @@ async function endCall(w: ParsedWebhook, row: CallRow): Promise<void> {
           ...h,
         });
   const endedAt = w.occurredAt ?? new Date().toISOString();
-  const { data } = await db
+  const { data, error: endError } = await db
     .from('telephony_calls')
     .update({ status: 'ended', end_reason: reason, hangup_cause: h.cause, sip_code: h.sipCode, ended_at: endedAt })
     .eq('id', row.id)
     .neq('status', 'ended')
     .select('id');
+  if (endError) throw endError;
   if (!data?.length) return; // already ended: exactly one `ended` per call
   if (row.direction === 'outbound') {
     if (row.caller_id) await emitEvent({ callerId: row.caller_id, callId: row.id, type: 'ended', reason });

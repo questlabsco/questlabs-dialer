@@ -35,15 +35,17 @@ serve(async (req) => {
 
   switch (body.action) {
     case 'start': {
-      // A caller has one agent leg at a time: close any previous one (e.g. after a crash).
-      await Promise.all([requireConfig(), endSessions(user.id)]);
-      const { data, error } = await db
-        .from('agent_sessions')
-        .insert({ caller_id: user.id, status: 'pending' })
-        .select('id')
-        .single();
-      if (error || !data) throw new HttpError(500, 'Could not start an audio session.', 'internal');
-      return json({ sessionId: data.id });
+      await requireConfig();
+      const {data,error}=await db.rpc('open_audio_session',{p_caller:user.id,p_replace:body.sessionId ?? null});
+      if(error) throw new HttpError(error.code==='QL409'?409:500,error.message,'session_error');
+      await Promise.all((data.retired as string[]).map(id=>callCommand(id,'hangup',{}).catch(()=>false)));
+      return json({sessionId:data.sessionId});
+    }
+    case 'heartbeat': {
+      const {data,error}=await db.from('agent_sessions').update({lease_until:new Date(Date.now()+90000).toISOString()})
+        .eq('id',body.sessionId).eq('caller_id',user.id).eq('status','live').select('id');
+      if(error || !data?.length) throw new HttpError(409,'The audio session has ended.','no_agent_leg');
+      return json({ok:true});
     }
     case 'status': {
       if (!body.sessionId) throw new HttpError(400, 'sessionId is required.', 'invalid');
