@@ -46,6 +46,8 @@ export type TelephonyEvent =
   | { type: 'checking' | 'screening' | 'voicemail'; callId: string }
   /** Someone picked up; audio is live to the caller immediately. */
   | { type: 'answered'; callId: string }
+  /** The voicemail check confirmed a person on an answered call (see `confirmsPeople`). */
+  | { type: 'human'; callId: string }
   /** Answering machine detected shortly after `answered`. The engine decides whether to hang up. */
   | { type: 'machine'; callId: string }
   /** Terminal event for a call; emitted exactly once per callId. */
@@ -94,4 +96,9 @@ export interface Telephony {
    * engine must not log them again.
    */
   readonly logsMissedInbound?: boolean;
+  /**
+   * Optional: true when an answered outbound call is followed by `human` once the voicemail check
+   * confirms a person (or `machine`). The engine then keeps its other lines ringing until it knows.
+   */
+  readonly confirmsPeople?: boolean;
 }

@@ -241,6 +241,8 @@ describe('TelnyxTelephony events', () => {
     backend.onRow!(ringing); // same row delivered twice
     backend.onRow!(row({ type: 'ringing', call_id: id })); // a second ringing row
     backend.onRow!(row({ type: 'answered', call_id: id }));
+    backend.onRow!(row({ type: 'human', call_id: id }));
+    backend.onRow!(row({ type: 'human', call_id: id })); // delivered twice: passed on once
     backend.onRow!(row({ type: 'machine', call_id: id }));
     backend.onRow!(row({ type: 'ended', call_id: id, reason: 'hangup_remote' }));
     backend.onRow!(row({ type: 'ended', call_id: id, reason: 'failed' }));
@@ -248,6 +250,7 @@ describe('TelnyxTelephony events', () => {
     expect(events).toEqual([
       { type: 'ringing', callId: id },
       { type: 'answered', callId: id },
+      { type: 'human', callId: id },
       { type: 'machine', callId: id },
       { type: 'ended', callId: id, reason: 'hangup_remote' },
     ]);

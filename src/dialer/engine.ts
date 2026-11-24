@@ -56,6 +56,11 @@ export const RING_GRACE_MS = 3_000;
 export const QUEUE_POLL_MS = 20_000;
 /** Talk time from which a call counts as a conversation (matches MetricsTotals). */
 export const CONVERSATION_MIN_SECONDS = 20;
+/**
+ * After a pickup, how long the other lines keep ringing while the voicemail check decides. The
+ * check normally answers in 2-5 s; without an answer by then the pickup is treated as a person.
+ */
+export const PERSON_CONFIRM_MS = 8_000;
 
 export const NO_CAPACITY_MESSAGE =
   'No outbound numbers have capacity left today. Ask your admin to add numbers or raise the daily caps.';
@@ -223,6 +228,8 @@ export class DialerEngine implements DialerControls {
    * for one of them is still in flight, that person picked up before our hangup: `dropped_pickup`.
    */
   private droppedCalls = new Map<string, string | null>();
+  /** An answered call the voicemail check has not confirmed as a person yet (other lines still ring). */
+  private unconfirmed: { callId: string; timer: ReturnType<typeof setTimeout> } | null = null;
 
   private queue: Promise<unknown> = Promise.resolve();
   private presenceChain: Promise<void> = Promise.resolve();
@@ -725,6 +732,7 @@ export class DialerEngine implements DialerControls {
 
   private resetInternals(): void {
     this.clearPoll();
+    this.clearUnconfirmed();
     for (const s of this.slots) if (s.timer) clearTimeout(s.timer);
     this.slots = [];
     this.active = null;
@@ -1101,6 +1109,8 @@ export class DialerEngine implements DialerControls {
         return;
       case 'answered':
         return this.onAnswered(e.callId);
+      case 'human':
+        return this.confirmPerson(e.callId);
       case 'machine':
         return this.onMachine(e.callId);
       case 'ended':
@@ -1175,7 +1185,11 @@ export class DialerEngine implements DialerControls {
     this.commit({ phase: 'connected', queueEmpty: false, session: this.bumpSession({ pickups: this.state.session.pickups + 1 }) });
     await this.unmuteForNewCall();
 
-    const dropped = await this.hangupLines(slot);
+    // With the voicemail check on, the other lines keep ringing until this pickup is confirmed as a
+    // person, so a voicemail does not cost the next lead.
+    let dropped: string[] = [];
+    if (this.settings.skipVoicemail && this.telephony.confirmsPeople) this.awaitPerson(callId);
+    else dropped = await this.hangupLines(slot);
     const p2 = this.pending;
     if (p2 && !p2.answering) {
       this.detach(p2.callId);
@@ -1190,10 +1204,35 @@ export class DialerEngine implements DialerControls {
     await this.release(dropped);
   }
 
+  private awaitPerson(callId: string): void {
+    this.clearUnconfirmed();
+    const timer = setTimeout(() => {
+      void this.run(() => this.confirmPerson(callId)).catch((e) => warn('confirming pickup', e));
+    }, PERSON_CONFIRM_MS);
+    this.unconfirmed = { callId, timer };
+  }
+
+  private clearUnconfirmed(): void {
+    if (this.unconfirmed) clearTimeout(this.unconfirmed.timer);
+    this.unconfirmed = null;
+  }
+
+  /** The pickup on `callId` is a person (or the check took too long): drop the other lines now. */
+  private async confirmPerson(callId: string): Promise<void> {
+    if (!this.unconfirmed || this.unconfirmed.callId !== callId) return;
+    this.clearUnconfirmed();
+    const a = this.active;
+    if (!a || a.callId !== callId || a.lineIndex === null) return;
+    const dropped = await this.hangupLines(this.slots[a.lineIndex]);
+    await this.release(dropped);
+  }
+
   private async onMachine(callId: string): Promise<void> {
     const a = this.active;
     if (!a || a.callId !== callId || a.direction !== 'outbound' || a.lineIndex === null) return;
     if (!this.settings.skipVoicemail) return;
+    // Voicemail: the other lines were still ringing and simply carry on.
+    if (this.unconfirmed?.callId === callId) this.clearUnconfirmed();
     const slot = this.slots[a.lineIndex];
     this.active = null;
     this.detach(callId);
@@ -1450,6 +1489,9 @@ export class DialerEngine implements DialerControls {
       await hangingUp;
       return;
     }
+    // Ending before the check decided (the caller hung up, or the lead did): settle the other lines
+    // as for any connected call, so none is answered during the wrap-up.
+    if (this.unconfirmed?.callId === a.callId) await this.confirmPerson(a.callId);
     this.active = null;
     this.detach(a.callId);
     if (a.manual && this.manual && this.manual.callId === a.callId) this.manual.status = 'done';

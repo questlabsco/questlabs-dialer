@@ -395,6 +395,23 @@ td.adm-clip {
   color: var(--text);
 }
 
+/* "Download template" row under the drop zone on the import screen. */
+.import-template {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: var(--font-sm);
+}
+
+.import-template > div {
+  flex: 1 1 260px;
+}
+
 .dropzone.dragging {
   border-color: var(--accent);
   background: var(--accent-soft);

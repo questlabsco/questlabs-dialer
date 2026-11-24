@@ -5,6 +5,7 @@ import { Badge, Button, Checkbox, IconAlert, IconCheck, IconDownload, IconUpload
 import { formatDate, formatPhone } from '../../../lib/format';
 import {
   IMPORT_TARGETS,
+  LEAD_TEMPLATE,
   UNSUPPORTED_SPREADSHEET_MESSAGE,
   WEAK_CONFIDENCE,
   analyzeGrid,
@@ -331,6 +332,22 @@ export function ImportWizard({ open, lists, users, onClose }: Props) {
                 {sourceError}
               </div>
             )}
+            <div className="import-template">
+              <div>
+                <strong>Not sure how to lay out your list?</strong>
+                <div className="muted adm-small">
+                  Use the template: one row per person, a phone number on every row, and the company or contact name. Keep
+                  links (LinkedIn, job posts) out of the phone columns. Delete the two example rows before importing.
+                </div>
+              </div>
+              <Button
+                size="sm"
+                icon={<IconDownload />}
+                onClick={() => downloadCsv(LEAD_TEMPLATE.fileName, LEAD_TEMPLATE.fields, LEAD_TEMPLATE.rows)}
+              >
+                Download template
+              </Button>
+            </div>
             <Textarea
               label="Or paste cells from Excel or Google Sheets"
               hint="Include the header row if there is one"

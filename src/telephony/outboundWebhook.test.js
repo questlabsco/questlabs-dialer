@@ -76,4 +76,29 @@ describe('outbound call routing', () => {
     await handle({ ...ended, clientState: { k: 'out', playback: 'voicemail' } }, { ...row, media_phase: 'voicemail' });
     expect(calls.command).toHaveBeenLastCalledWith('pstn', 'hangup', expect.anything());
   });
+
+  const instant = { ...row, has_screening: false, has_voicemail: false, wait_for_greeting: false };
+  const emitted = () => calls.emit.mock.calls.map(([e]) => e.type);
+  it('joins the caller the moment anyone picks up when no recording or intro is set', async () => {
+    await handle({ kind: 'answered' }, instant);
+    expect(calls.command).toHaveBeenCalledWith('agent', 'bridge', expect.anything(), false);
+    expect(emitted()).not.toContain('checking');
+  });
+  it('reports voicemail on a joined call and leaves the hang-up to the app', async () => {
+    await handle(event('machine', 'call.machine.premium.detection.ended'), { ...instant, status: 'answered' });
+    expect(emitted()).toEqual(['machine']);
+    expect(calls.command).not.toHaveBeenCalled();
+  });
+  it('confirms a person, including "not sure" and "silence", instead of hanging up', async () => {
+    for (const r of ['human_business', 'human_residence', 'not_sure', 'silence']) {
+      await handle(event(r, 'call.machine.premium.detection.ended'), { ...instant, status: 'answered' });
+    }
+    expect(emitted()).toEqual(['human', 'human', 'human', 'human']);
+    expect(calls.command).not.toHaveBeenCalled();
+  });
+  it('with a recorded message set, an unsure pickup is joined to the caller, never hung up', async () => {
+    await handle(event('not_sure', 'call.machine.premium.detection.ended'), row);
+    expect(calls.command).toHaveBeenCalledWith('agent', 'bridge', expect.anything(), false);
+    expect(calls.command).not.toHaveBeenCalledWith('pstn', 'hangup', expect.anything());
+  });
 });

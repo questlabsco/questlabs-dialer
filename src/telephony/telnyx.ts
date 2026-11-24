@@ -100,6 +100,7 @@ async function defaultRequestMicrophone(): Promise<void> {
 export class TelnyxTelephony implements Telephony {
   readonly kind = 'telnyx' as const;
   readonly logsMissedInbound = true;
+  readonly confirmsPeople = true;
 
   private _connected = false;
   private connecting: Promise<void> | null = null;
@@ -618,7 +619,8 @@ export class TelnyxTelephony implements Telephony {
         this.emit({ type: row.type, callId });
         return;
       case 'ringing':
-      case 'machine': {
+      case 'machine':
+      case 'human': {
         if (call.answered && row.type === 'ringing') return;
         const key = `${callId}:${row.type}`;
         if (this.emitted.has(key)) return;

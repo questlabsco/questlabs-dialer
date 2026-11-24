@@ -14,7 +14,7 @@
 
 export type EndReason = 'voicemail' | 'no_answer' | 'busy' | 'failed' | 'bad_number' | 'hangup_local' | 'hangup_remote';
 
-export type TelephonyEventType = 'checking' | 'screening' | 'voicemail' | 'ringing' | 'answered' | 'machine' | 'ended' | 'incoming' | 'error';
+export type TelephonyEventType = 'checking' | 'screening' | 'voicemail' | 'human' | 'ringing' | 'answered' | 'machine' | 'ended' | 'incoming' | 'error';
 
 /** A row of `telephony_events` as the app receives it. */
 export interface TelephonyEventRow {
@@ -469,6 +469,15 @@ export function amdOutcome(eventType: string, result: unknown): 'voicemail' | 's
     default:
       return null;
   }
+}
+
+/**
+ * True when an AMD result means a person (or may well be one) answered. Telnyx recommends treating
+ * "not sure" as a person; "silence" is usually someone waiting for us to speak first.
+ */
+export function isPersonResult(eventType: string, result: unknown): boolean {
+  if (eventType !== 'call.machine.premium.detection.ended' && eventType !== 'call.machine.detection.ended') return false;
+  return typeof result === 'string' && (result.startsWith('human') || result === 'not_sure' || result === 'silence');
 }
 
 export const SCREENING_INTRO_VOICE = MISSED_CALLBACK_SPEECH.voice;

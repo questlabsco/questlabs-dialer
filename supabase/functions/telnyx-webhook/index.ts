@@ -10,6 +10,7 @@ import {
   agentBridgeBody,
   agentSessionIdOf,
   amdOutcome,
+  isPersonResult,
   screeningIntroSpeakBody,
   screeningIntroText,
   base64ToBytes,
@@ -234,7 +235,10 @@ export async function handleOutbound(w: ParsedWebhook, row: CallRow): Promise<vo
       return;
     }
     case 'answered':
-      if (row.classify) {
+      // Recorded messages or a screening intro need the greeting first, so the caller is joined only
+      // once a person is confirmed. Otherwise the caller is joined the moment anyone picks up (no dead
+      // air for a real person) and the voicemail check keeps running; voicemail is hung up by the app.
+      if (row.classify && row.wait_for_greeting) {
         if (callerId && row.status !== 'ended') await emitEvent({callerId,callId:row.id,type:'checking'});
         return;
       }
@@ -300,18 +304,26 @@ async function onMachineEvent(w: ParsedWebhook, row: CallRow): Promise<void> {
   const ccid = w.callControlId ?? row.call_control_id;
   if (!ccid || !row.caller_id || row.status === 'ended' || row.local_end_reason) return;
   const outcome = amdOutcome(w.eventType, w.machineResult);
-  if (!row.classify) {
-    if (row.status === 'answered' && (outcome === 'voicemail' || outcome === 'suspect'))
+  // Telnyx: treat "not sure" as a person. "Silence" is often a person waiting for us to speak.
+  const person = isPersonResult(w.eventType, w.machineResult);
+  if (!row.classify || !row.wait_for_greeting) {
+    // The caller was joined at pickup: confirm a person (the app then drops its other lines) or
+    // report voicemail (the app hangs up and keeps dialing).
+    if (row.status !== 'answered') {
+      if (person && row.classify) return answerOutbound(w, row);
+      return;
+    }
+    if (person) {
+      if (row.classify) await emitEvent({callerId:row.caller_id,callId:row.id,type:'human'});
+      return;
+    }
+    if (outcome === 'voicemail' || outcome === 'suspect')
       await emitEvent({callerId:row.caller_id,callId:row.id,type:'machine'});
     return;
   }
   // Replaying the human result can finish an interrupted bridge command. Its command id is stable.
-  if (w.machineResult?.startsWith('human')) return answerOutbound(w,row);
+  if (person) return answerOutbound(w,row);
   if (row.status === 'answered') return;
-  if (w.machineResult === 'not_sure' || w.machineResult === 'silence') {
-    await callCommand(ccid,'hangup',{command_id:'unknown-'+row.id});
-    return;
-  }
   // A tone identifies the screener. Only the end of its question invites a response.
   const isPrompt = w.machineResult === 'prompt_ended';
   if (outcome === 'screening' && !isPrompt) {

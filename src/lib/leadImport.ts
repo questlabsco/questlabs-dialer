@@ -270,6 +270,8 @@ export function checkUsPhone(raw: string): PhoneCheck {
  * pieces that could not be used.
  */
 export function splitPhoneCell(cell: string): { phones: string[]; rejected: { value: string; reason: 'international' | 'invalid' }[] } {
+  // A link is never a phone, even when it ends in 10 digits (LinkedIn job and profile ids).
+  if (looksLikeUrl(cell)) return { phones: [], rejected: [{ value: cell.trim(), reason: 'invalid' }] };
   // Drop extensions anywhere in the cell ("214-555-0123 x12 / 972-555-0100 ext. 4").
   const value = cell.replace(/[,;]?\s*(?:x|ext|extn|extension|#)\s*[.:]?\s*\d{1,6}(?=\s*(?:$|[/;,|\n]|\bor\b))/gi, '').trim();
   if (!value) return { phones: [], rejected: [] };
@@ -291,6 +293,12 @@ export function splitPhoneCell(cell: string): { phones: string[]; rejected: { va
     if (whole.ok) return { phones: [whole.e164], rejected: [] };
   }
   return { phones, rejected };
+}
+
+/** A web address or link ("https://…", "www.…", "linkedin.com/in/…"). */
+export function looksLikeUrl(v: string): boolean {
+  const t = v.trim();
+  return /^(https?:\/\/|www\.)/i.test(t) || /^[a-z0-9-]+(\.[a-z0-9-]+)+\/\S*/i.test(t);
 }
 
 function cellHasPhone(v: string): boolean {
@@ -504,8 +512,13 @@ function guessFromHeader(header: string): HeaderGuess {
   if (has(w, 'notes', 'note', 'comments', 'comment', 'description', 'remarks', 'memo', 'details', 'about', 'summary', 'bio')) {
     return { field: 'notes', score: 0.85 };
   }
+  // "person_location", "Company HQ", "Based in": where someone is, never who they are. Kept in the
+  // notes; the cell contents may still make the column the city.
+  if (has(w, 'location', 'located', 'based', 'hq', 'headquarters', 'headquartered')) {
+    return { field: null, score: 0, keepExtra: true, contentCap: 0.5 };
+  }
   const notBusiness = has(
-    w, 'address', 'street', 'website', 'url', 'domain', 'linkedin', 'facebook', 'twitter', 'size', 'industry',
+    w, 'address', 'street', 'website', 'url', 'link', 'domain', 'linkedin', 'facebook', 'twitter', 'posting', 'size', 'industry',
     'revenue', 'employees', 'zip', 'postal', 'postcode', 'country', 'keywords', 'founded', 'sic', 'naics', 'code',
   );
   // A bare "title" is a job title in contact exports (Owner, Founder) but the business's name in
@@ -857,3 +870,20 @@ export function analyzeGrid(grid: string[][], hasHeaderOverride?: boolean): Shee
   const columns = buildColumns(grid, hasHeader);
   return { grid, hasHeader, columns, mappings: guessMappings(columns) };
 }
+
+// ---------------------------------------------------------------------------
+// Example template (downloadable from the import screen)
+// ---------------------------------------------------------------------------
+
+/**
+ * The lead-list template admins can download and fill in. Every header is one the importer maps
+ * with certainty, so a filled-in copy needs no column fixes. One row per person to call.
+ */
+export const LEAD_TEMPLATE: { fileName: string; fields: string[]; rows: string[][] } = {
+  fileName: 'Quest Labs lead list template.csv',
+  fields: ['Company', 'Contact Name', 'Mobile Phone', 'Office Phone', 'Email', 'City', 'State', 'Job Title', 'Website', 'Notes'],
+  rows: [
+    ['Example Plumbing LLC', 'Jordan Smith', '(214) 555-0101', '(214) 555-0199', 'jordan@exampleplumbing.com', 'Dallas', 'TX', 'Owner', 'exampleplumbing.com', 'EXAMPLE ROW - delete before importing. Saw their post about hiring a dispatcher.'],
+    ['Sample Roofing Co', 'Taylor Lee', '(817) 555-0102', '', '', 'Fort Worth', 'TX', 'General Manager', '', 'EXAMPLE ROW - delete before importing.'],
+  ],
+};

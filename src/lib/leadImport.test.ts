@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import Papa from 'papaparse';
 import {
   analyzeSheet,
   checkUsPhone,
@@ -8,6 +9,7 @@ import {
   guessMappings,
   buildColumns,
   isUnsupportedSpreadsheet,
+  LEAD_TEMPLATE,
   listNameFromFileName,
   mappingWarnings,
   markExisting,
@@ -18,6 +20,7 @@ import {
   setColumnTarget,
   skippedRowsTable,
   splitPhoneCell,
+  looksLikeUrl,
   WEAK_CONFIDENCE,
   type ColumnMapping,
   type ImportTarget,
@@ -354,5 +357,65 @@ describe('map-scraper exports', () => {
     const rows = prepareRows(a.grid, a.hasHeader, a.columns, a.mappings);
     expect(rows.map((r) => r.lead.businessName)).toEqual(['Cole Landscaping', 'Patel Auto Glass']);
     expect(rows.map((r) => r.lead.contactName)).toEqual(['Dana Cole', 'Raj Patel']);
+  });
+});
+
+describe('LinkedIn people exports (several people per company)', () => {
+  const csv = [
+    'region,company,industry,company_hq,job_posting,name,title,person_location,phone,linkedin,call_opener,phone_e164',
+    'DFW,Acme Fasteners Inc.,Manufacturing,Arlington,https://www.linkedin.com/jobs/view/csr-at-acme-4465844798,Dana Cole,General Manager,Mansfield TX,(817) 555-0101,https://www.linkedin.com/in/dana-cole-1234567890,"Hey Dana, it\'s [your name] with Quest Labs. I saw Acme is hiring.",+18175550101',
+    'DFW,Acme Fasteners Inc.,Manufacturing,Arlington,https://www.linkedin.com/jobs/view/csr-at-acme-4465844798,Raj Patel,CFO,Arlington TX,(817) 555-0102,https://www.linkedin.com/in/raj-patel-9876543210,"Hey Raj, it\'s [your name] with Quest Labs. I saw Acme is hiring.",+18175550102',
+  ].join('\n');
+
+  it('uses the name column for the contact, not the location', () => {
+    const a = analyzeSheet(csv);
+    const target = (h: string) => a.mappings[a.columns.findIndex((c) => c.header === h)];
+    expect(target('name').target).toBe('contactName');
+    expect(target('person_location').target).toBe('ignore');
+    expect(target('person_location').keepAsExtra).toBe(true);
+    expect(target('company').target).toBe('businessName');
+  });
+
+  it('never reads a phone number out of a link, so people at one company are not duplicates', () => {
+    const a = analyzeSheet(csv);
+    const target = (h: string) => a.mappings[a.columns.findIndex((c) => c.header === h)].target;
+    expect(target('job_posting')).toBe('ignore');
+    expect(target('linkedin')).toBe('ignore');
+    const rows = prepareRows(a.grid, a.hasHeader, a.columns, a.mappings);
+    expect(rows.map((r) => r.status)).toEqual(['ready', 'ready']);
+    expect(rows.map((r) => r.lead.contactName)).toEqual(['Dana Cole', 'Raj Patel']);
+    expect(rows.map((r) => r.lead.phones)).toEqual([['+18175550101'], ['+18175550102']]);
+    expect(rows[0].lead.notes).toContain('person_location: Mansfield TX');
+  });
+
+  it('a link in a phone column is rejected, not dialed', () => {
+    expect(splitPhoneCell('https://www.linkedin.com/jobs/view/4465844798').phones).toEqual([]);
+    expect(looksLikeUrl('linkedin.com/in/someone-1234567890')).toBe(true);
+    expect(looksLikeUrl('(214) 555-0101')).toBe(false);
+  });
+});
+
+describe('downloadable template', () => {
+  it('maps every column with certainty and imports both example rows', () => {
+    const csv = Papa.unparse({ fields: LEAD_TEMPLATE.fields, data: LEAD_TEMPLATE.rows });
+    const a = analyzeSheet(csv);
+    expect(a.hasHeader).toBe(true);
+    const t = (h: string) => mappingOf(a, h);
+    expect(t('Company').target).toBe('businessName');
+    expect(t('Contact Name').target).toBe('contactName');
+    expect(t('Mobile Phone').target).toBe('phone1');
+    expect(t('Office Phone').target).toBe('phone2');
+    expect(t('Email').target).toBe('email');
+    expect(t('City').target).toBe('city');
+    expect(t('State').target).toBe('state');
+    expect(t('Notes').target).toBe('notes');
+    expect(t('Job Title')).toMatchObject({ target: 'ignore', keepAsExtra: true });
+    expect(t('Website')).toMatchObject({ target: 'ignore', keepAsExtra: true });
+    for (const m of a.mappings) if (m.target !== 'ignore') expect(m.confidence).toBeGreaterThanOrEqual(WEAK_CONFIDENCE);
+    const rows = rowsOf(a);
+    expect(rows.map((r) => r.status)).toEqual(['ready', 'ready']);
+    expect(rows[0].lead).toMatchObject({ businessName: 'Example Plumbing LLC', contactName: 'Jordan Smith', phones: ['+12145550101', '+12145550199'], city: 'Dallas', state: 'TX' });
+    expect(rows[0].lead.notes).toContain('Job Title: Owner');
+    expect(mappingWarnings(a.mappings)).toMatchObject({ noPhone: false, noName: false });
   });
 });

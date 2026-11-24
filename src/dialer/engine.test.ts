@@ -10,6 +10,7 @@ import {
   MANUAL_INVALID_NUMBER_MESSAGE,
   MANUAL_WHILE_DIALING_MESSAGE,
   NO_CAPACITY_MESSAGE,
+  PERSON_CONFIRM_MS,
   QUEUE_POLL_MS,
   RING_GRACE_MS,
 } from './engine';
@@ -32,6 +33,7 @@ class FakeTelephony implements Telephony {
   standbyStops = 0;
   failAnswer: Error | null = null;
   logsMissedInbound = false;
+  confirmsPeople = false;
   private live = new Set<string>();
   private seq = 0;
   private listeners = new Set<TelephonyListener>();
@@ -395,6 +397,77 @@ describe('dialer engine: pickups', () => {
     await t.engine.submitDisposition({ disposition: 'not_interested', notes: '' });
     await t.settle();
     expect(t.tel.dials.slice(2).map((d) => d.to)).toContain(b.to);
+  });
+
+  describe('joined at pickup, voicemail check still running', () => {
+    const start = async () => {
+      const t = await setup({ leads: leadRows(3) });
+      t.tel.confirmsPeople = true;
+      await t.engine.start();
+      await t.settle();
+      return t;
+    };
+
+    it('keeps the other line ringing until the pickup is confirmed as a person', async () => {
+      const t = await start();
+      const [a, b] = t.tel.dials;
+      await t.emit({ type: 'answered', callId: a.callId });
+      expect(t.engine.getState().phase).toBe('connected');
+      expect(t.tel.hangups).toEqual([]);
+      expect(t.engine.getState().lines[1].status).toBe('ringing');
+      await t.emit({ type: 'human', callId: a.callId });
+      expect(t.tel.hangups).toEqual([b.callId]);
+      expect(t.callFor(b.callId).result).toBe('dropped');
+      expect(t.lead('Biz 1').lockedBy).toBeNull();
+    });
+
+    it('a voicemail pickup is skipped and the other line simply keeps ringing', async () => {
+      const t = await start();
+      const [a, b] = t.tel.dials;
+      await t.emit({ type: 'answered', callId: a.callId });
+      await t.emit({ type: 'machine', callId: a.callId });
+      expect(t.engine.getState().phase).toBe('dialing');
+      expect(t.tel.hangups).toEqual([a.callId]);
+      expect(t.callFor(a.callId).result).toBe('voicemail');
+      // Line 2 was never touched and can still connect.
+      await t.emit({ type: 'answered', callId: b.callId });
+      expect(t.engine.getState().activeCall?.callId).toBe(b.callId);
+      // A late timer from the first pickup changes nothing.
+      await vi.advanceTimersByTimeAsync(PERSON_CONFIRM_MS);
+      await t.settle();
+      expect(t.engine.getState().activeCall?.callId).toBe(b.callId);
+    });
+
+    it('without a verdict in time, the pickup counts as a person and the other line is dropped', async () => {
+      const t = await start();
+      const [a, b] = t.tel.dials;
+      await t.emit({ type: 'answered', callId: a.callId });
+      await vi.advanceTimersByTimeAsync(PERSON_CONFIRM_MS - 1);
+      expect(t.tel.hangups).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      await t.settle();
+      expect(t.tel.hangups).toEqual([b.callId]);
+    });
+
+    it('if the call ends before the verdict, the other line is dropped before the wrap-up', async () => {
+      const t = await start();
+      const [a, b] = t.tel.dials;
+      await t.emit({ type: 'answered', callId: a.callId });
+      await t.engine.hangUp();
+      await t.settle();
+      expect(t.engine.getState().phase).toBe('wrap_up');
+      expect(t.tel.hangups).toContain(b.callId);
+      expect(t.engine.getState().lines.every((l) => l.status !== 'ringing')).toBe(true);
+    });
+
+    it('a second pickup while the first is unconfirmed is dropped', async () => {
+      const t = await start();
+      const [a, b] = t.tel.dials;
+      await t.emit({ type: 'answered', callId: a.callId });
+      await t.emit({ type: 'answered', callId: b.callId });
+      expect(t.engine.getState().activeCall?.callId).toBe(a.callId);
+      expect(t.callFor(b.callId).result).toBe('dropped_pickup');
+    });
   });
 
   it('second pickup race: hung up as dropped_pickup and released', async () => {
